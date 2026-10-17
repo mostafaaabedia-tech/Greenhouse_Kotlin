@@ -3,7 +3,8 @@
 Developed by **Mostafa Mesbah Aabedi** and **Milad Ahmadi**.
 
 Native Android app (Kotlin + Jetpack Compose) for the HBRT ESP32 greenhouse.
-Works with the existing `hbrt_greenhouse.ino` firmware (WebSocket on port 81).
+Flash `firmware/hbrt_greenhouse/hbrt_greenhouse.ino` (v4.0) to the ESP32. It adds network discovery,
+the greenhouse name, water-now and the grow-light schedule. Older firmware still connects, without those extras.
 
 ## Build the APK with GitHub
 1. Push this folder to the root of a GitHub repository (branch `main`).
@@ -14,6 +15,11 @@ Works with the existing `hbrt_greenhouse.ino` firmware (WebSocket on port 81).
 Open the folder in Android Studio (Koala or newer) and press Run.
 
 ## Features
+- Finds greenhouses on your Wi-Fi or phone hotspot automatically; save several and switch between them
+- Name each greenhouse (stored on the ESP32)
+- Plant health score, plain-language status, animated device icons, live water tank
+- Crop presets (tomato, cucumber, pepper, lettuce, strawberry, herbs)
+- Water now (5–60 s) and grow-light schedule
 - Live dashboard: gauges, live charts, Wi-Fi signal, uptime, active alerts
 - Controls: auto/manual, fan, pump, lights, heater, vent, "turn everything off"
 - Stable connection: ping every 5 s, dead-link watchdog, auto-reconnect with back-off,

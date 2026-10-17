@@ -2,6 +2,7 @@ package com.hbrt.agro
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
@@ -19,7 +20,10 @@ import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 import org.json.JSONObject
+import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.URI
+import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
 import kotlin.math.pow
@@ -59,13 +63,19 @@ object GreenhouseClient {
     @Volatile var url = ""
         private set
 
+    /** The address the user typed or picked (IP or URL). */
+    @Volatile var address = ""
+        private set
+
     @Volatile private var wifi: Network? = null
+    @Volatile private var wifiProps: LinkProperties? = null
     @Volatile private var gen = 0
     @Volatile private var manual = true
     @Volatile private var keepTrying = false
     private var ws: WebSocket? = null
     private var retryJob: Job? = null
     private var lastLogged = 0L
+    @Volatile private var namedAs = ""
     private var lastPrune = 0L
 
     fun init(c: Context) {
@@ -88,8 +98,12 @@ object GreenhouseClient {
                 kick()
             }
 
+            override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
+                if (wifi == network) wifiProps = lp
+            }
+
             override fun onLost(network: Network) {
-                if (wifi == network) wifi = null
+                if (wifi == network) { wifi = null; wifiProps = null }
             }
         })
         cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
@@ -97,14 +111,27 @@ object GreenhouseClient {
         })
     }
 
-    private fun isLocal(host: String) =
-        host.startsWith("192.168.") || host.startsWith("10.") ||
-            Regex("^172\\.(1[6-9]|2\\d|3[01])\\.").containsMatchIn(host)
+    /** True when [host] is an IPv4 address inside the Wi-Fi network's subnet. */
+    private fun onWifiSubnet(host: String): Boolean {
+        val lp = wifiProps ?: return false
+        if (!Regex("^\\d+\\.\\d+\\.\\d+\\.\\d+$").matches(host)) return false
+        val target = try { InetAddress.getByName(host).address } catch (e: Exception) { return false }
+        return lp.linkAddresses.any { la ->
+            val a = la.address
+            if (a !is Inet4Address) return@any false
+            val mine = a.address
+            val bits = la.prefixLength
+            (0 until 32).all { i -> i >= bits || ((mine[i / 8].toInt() shr (7 - i % 8)) and 1) == ((target[i / 8].toInt() shr (7 - i % 8)) and 1) }
+        }
+    }
 
-    /** HTTP client that sends local-network traffic over Wi-Fi. Also used by the AI client. */
+    /**
+     * HTTP client for [host]. Addresses on the Wi-Fi subnet are forced over Wi-Fi, so the app still
+     * reaches the ESP32 when that Wi-Fi has no internet. Hotspot addresses use the normal route.
+     */
     fun httpFor(host: String): OkHttpClient {
         val w = wifi
-        return if (w != null && isLocal(host)) http.newBuilder().socketFactory(w.socketFactory).build() else http
+        return if (w != null && onWifiSubnet(host)) http.newBuilder().socketFactory(w.socketFactory).build() else http
     }
 
     fun buildUrl(input: String): String {
@@ -129,7 +156,8 @@ object GreenhouseClient {
             link.value = Link.FAILED
             return
         }
-        Prefs.lastAddress = input.trim()
+        address = input.trim()
+        Prefs.lastAddress = address
         manual = false
         keepTrying = persistent
         linked.value = false
@@ -161,6 +189,7 @@ object GreenhouseClient {
                 linked.value = true
                 Prefs.autoConnect = true
                 link.value = Link.ONLINE
+                syncClock(webSocket)
             }
 
             override fun onMessage(webSocket: WebSocket, text: String) {
@@ -223,15 +252,36 @@ object GreenhouseClient {
         activeAlerts.value = emptyMap()
     }
 
+    /** Sends the phone's local time so the ESP32 can run the light schedule. */
+    private fun syncClock(w: WebSocket) {
+        val now = System.currentTimeMillis()
+        val local = (now + TimeZone.getDefault().getOffset(now)) / 1000
+        w.send(JSONObject().put("device", "time").put("value", local).toString())
+    }
+
     fun send(json: String): Boolean = link.value == Link.ONLINE && ws?.send(json) == true
 
     fun command(device: String, value: Boolean): Boolean =
         send(JSONObject().put("device", device).put("value", value).toString())
 
+    fun waterNow(seconds: Int): Boolean =
+        send(JSONObject().put("device", "water").put("value", seconds).toString())
+
+    fun rename(name: String): Boolean {
+        val ok = send(JSONObject().put("device", "name").put("value", name).toString())
+        if (ok) Prefs.saveGreenhouse(SavedGh(name, address, latest.value?.id ?: ""))
+        return ok
+    }
+
     private fun handle(text: String) {
         lastMsgAt = System.currentTimeMillis()
         val r = Reading.parse(text) ?: return
+        val first = latest.value == null
         latest.value = r
+        if (first || r.name != namedAs) {           // remember this greenhouse under its own name
+            namedAs = r.name
+            Prefs.saveGreenhouse(SavedGh(r.name, address, r.id))
+        }
         live.value = (live.value + r).takeLast(90)
 
         val now = r.ts
