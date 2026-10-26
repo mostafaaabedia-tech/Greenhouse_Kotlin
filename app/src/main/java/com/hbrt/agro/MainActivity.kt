@@ -197,7 +197,13 @@ fun HomeScreen() {
         if (saved.isNotEmpty()) item { Text("Your greenhouses", color = TextC, fontSize = 18.sp, fontWeight = FontWeight.Bold) }
         items(saved, key = { "s" + it.addr }) { g ->
             GreenhouseRow(
-                name = g.name.ifBlank { "Greenhouse" }, addr = g.addr,
+                name = g.name.ifBlank { "Greenhouse" },
+                addr = when {
+                    g.cloudOnly -> "Cloud  ·  works from anywhere"
+                    g.hasCloud -> "${g.addr}  ·  Wi-Fi + cloud"
+                    else -> "${g.addr}  ·  Wi-Fi only"
+                },
+                cloud = g.hasCloud,
                 connecting = busy && connectingTo == g.addr, enabled = !busy,
                 onOpen = { connect(g.addr) }, onForget = { forget = g }
             )
@@ -235,10 +241,11 @@ fun HomeScreen() {
         items(newOnes, key = { "f" + it.ip }) { f ->
             Box(Modifier.animateItem()) {
                 GreenhouseRow(
-                    name = f.name, addr = "${f.ip}  ·  firmware ${f.fw}", connecting = busy && connectingTo == f.ip,
+                    name = f.name, addr = "${f.ip}  ·  firmware ${f.fw}", cloud = f.cloud.isNotEmpty(),
+                    connecting = busy && connectingTo == f.ip,
                     enabled = !busy, isNew = true,
                     onOpen = {
-                        Prefs.saveGreenhouse(SavedGh(f.name, f.ip, f.id))
+                        Prefs.saveGreenhouse(SavedGh(f.name, f.ip, f.id, f.cloud))
                         saved = Prefs.greenhouses
                         connect(f.ip)
                     }
@@ -248,20 +255,20 @@ fun HomeScreen() {
         if (scanned && found.isEmpty()) item {
             Text(
                 "Nothing found. Check that the ESP32 is powered, on the same Wi-Fi as this phone (or on its hotspot), " +
-                    "and running firmware 4.0. You can also add it by IP address below.",
+                    "and running firmware 4.0 or newer. Away from home? Paste the greenhouse's share link below.",
                 color = Muted, fontSize = 13.sp
             )
         }
         item {
             Column(Modifier.fillMaxWidth().card().padding(horizontal = 16.dp, vertical = 6.dp)) {
                 TextButton(onClick = { manual = !manual }) {
-                    Text(if (manual) "Hide" else "Add by IP address or tunnel URL", color = Neon)
+                    Text(if (manual) "Hide" else "Add with a share link or IP address", color = Neon)
                 }
                 AnimatedVisibility(manual, enter = expandVertically() + fadeIn(), exit = shrinkVertically() + fadeOut()) {
                     Column(Modifier.padding(bottom = 12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
                         OutlinedTextField(
                             addr, { addr = it }, singleLine = true,
-                            placeholder = { Text("192.168.1.50 or https://…") },
+                            placeholder = { Text("Share link, or 192.168.1.50") },
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri, imeAction = ImeAction.Go),
                             keyboardActions = KeyboardActions(onGo = { if (addr.isNotBlank()) connect(addr.trim()) }),
                             colors = field(), modifier = Modifier.fillMaxWidth()
@@ -301,7 +308,7 @@ fun HomeScreen() {
 
 @Composable
 fun GreenhouseRow(
-    name: String, addr: String, connecting: Boolean, enabled: Boolean, isNew: Boolean = false,
+    name: String, addr: String, connecting: Boolean, enabled: Boolean, isNew: Boolean = false, cloud: Boolean = false,
     onOpen: () -> Unit, onForget: (() -> Unit)? = null,
 ) {
     Row(
@@ -314,7 +321,13 @@ fun GreenhouseRow(
         Spacer(Modifier.width(14.dp))
         Column(Modifier.weight(1f)) {
             Text(name, color = TextC, fontSize = 17.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-            Text(addr, color = Muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                if (cloud) {
+                    CloudIcon(Blue, Modifier.size(14.dp))
+                    Spacer(Modifier.width(5.dp))
+                }
+                Text(addr, color = Muted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+            }
         }
         when {
             connecting -> CircularProgressIndicator(Modifier.size(22.dp), color = Neon, strokeWidth = 2.dp)
@@ -341,6 +354,11 @@ fun MainScreen() {
     val r by GreenhouseClient.latest.collectAsStateWithLifecycle()
     val link by GreenhouseClient.link.collectAsStateWithLifecycle()
     val attempt by GreenhouseClient.attempt.collectAsStateWithLifecycle()
+    val via by GreenhouseClient.via.collectAsStateWithLifecycle()
+    val boardOnline by GreenhouseClient.boardOnline.collectAsStateWithLifecycle()
+    val boardDown = link == Link.ONLINE && via == Via.CLOUD && !boardOnline
+    var now by remember { mutableStateOf(System.currentTimeMillis()) }
+    LaunchedEffect(Unit) { while (true) { kotlinx.coroutines.delay(5000); now = System.currentTimeMillis() } }
     var askedName by rememberSaveable { mutableStateOf(false) }
     var newName by rememberSaveable { mutableStateOf("") }
 
@@ -356,19 +374,28 @@ fun MainScreen() {
                 TextButton(onClick = { leaveGreenhouse(ctx) }) { Text("‹", color = TextC, fontSize = 28.sp) }
                 Column(Modifier.weight(1f)) {
                     Text(
-                        r?.name?.ifBlank { null } ?: Prefs.greenhouses.firstOrNull { it.addr == GreenhouseClient.address }?.name?.ifBlank { null } ?: "Greenhouse",
+                        r?.name?.ifBlank { null } ?: Prefs.greenhouses.firstOrNull { it.addr == GreenhouseClient.address }?.name?.ifBlank { null }
+                            ?: "Greenhouse",
                         color = TextC, fontSize = 18.sp, fontWeight = FontWeight.Bold, maxLines = 1, overflow = TextOverflow.Ellipsis
                     )
                     Text(
                         when {
                             link != Link.ONLINE -> "Reconnecting…"
-                            r?.auto != false -> "Online  ·  automatic"
-                            else -> "Online  ·  manual"
+                            boardDown -> "Greenhouse offline  ·  last seen ${ago(now - GreenhouseClient.lastMsgAt)}"
+                            else -> "Online  ·  " + (if (via == Via.CLOUD) "via cloud" else "via Wi-Fi") +
+                                (if (r?.auto != false) "  ·  auto" else "  ·  manual")
                         },
-                        color = if (link == Link.ONLINE) Muted else Orange, fontSize = 12.sp
+                        color = if (link == Link.ONLINE && !boardDown) Muted else Orange, fontSize = 12.sp
                     )
                 }
-                PulseDot(if (link == Link.ONLINE) Neon else Orange, pulsing = link == Link.ONLINE)
+                if (via == Via.CLOUD && link == Link.ONLINE) {
+                    CloudIcon(if (boardDown) Orange else Blue, Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                }
+                PulseDot(
+                    when { link != Link.ONLINE || boardDown -> Orange; via == Via.CLOUD -> Blue; else -> Neon },
+                    pulsing = link == Link.ONLINE && !boardDown
+                )
             }
         },
         bottomBar = {
@@ -388,9 +415,13 @@ fun MainScreen() {
         }
     ) { pad ->
         Column(Modifier.padding(pad).fillMaxSize()) {
-            AnimatedVisibility(link != Link.ONLINE, enter = expandVertically(), exit = shrinkVertically()) {
+            AnimatedVisibility(link != Link.ONLINE || boardDown, enter = expandVertically(), exit = shrinkVertically()) {
                 Text(
-                    if (attempt > 0) "Connection lost. Retrying (attempt $attempt)…" else "Connecting to the greenhouse…",
+                    when {
+                        boardDown -> "The greenhouse is not sending. Showing its last reading. Check its power and Wi-Fi."
+                        attempt > 0 -> "Connection lost. Retrying (attempt $attempt)…"
+                        else -> "Connecting to the greenhouse…"
+                    },
                     Modifier.fillMaxWidth().background(Orange).padding(7.dp),
                     color = Color.Black, fontSize = 12.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center
                 )
@@ -405,7 +436,7 @@ fun MainScreen() {
             ) { t ->
                 when (t) {
                     Tab.Home -> DashboardTab(r)
-                    Tab.Controls -> ControlsTab(r, link == Link.ONLINE)
+                    Tab.Controls -> ControlsTab(r, link == Link.ONLINE && !boardDown)
                     Tab.Data -> DataTab()
                     Tab.Ai -> AiTab(r)
                     Tab.Config -> ConfigTab(r)

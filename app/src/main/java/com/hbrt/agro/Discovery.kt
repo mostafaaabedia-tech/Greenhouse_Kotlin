@@ -13,7 +13,7 @@ import java.net.NetworkInterface
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
-data class Found(val name: String, val ip: String, val id: String, val fw: String)
+data class Found(val name: String, val ip: String, val id: String, val fw: String, val cloud: String = "")
 
 /**
  * Finds HBRT boards on every local network the phone is part of: the Wi-Fi it is connected to
@@ -51,7 +51,11 @@ object Discovery {
                 if (r.isSuccessful) {
                     val j = JSONObject(r.body?.string() ?: "")
                     if (j.optString("app") == "hbrt") {
-                        return Found(j.optString("name", "Greenhouse"), ip, j.optString("id"), j.optString("fw"))
+                        val key = j.optString("key"); val db = j.optString("db")
+                        return Found(
+                            j.optString("name", "Greenhouse"), ip, j.optString("id"), j.optString("fw"),
+                            if (key.length >= 16 && db.isNotEmpty()) "$key@$db" else ""
+                        )
                     }
                 }
             }

@@ -548,3 +548,27 @@ fun Radar(modifier: Modifier = Modifier.size(180.dp)) {
         drawCircle(Neon, 5.dp.toPx())
     }
 }
+
+/** Small cloud glyph for "connected through the cloud". */
+@Composable
+fun CloudIcon(color: Color, modifier: Modifier = Modifier.size(18.dp)) {
+    Canvas(modifier) {
+        val w = size.width
+        val h = size.height
+        drawCircle(color, w * 0.22f, Offset(w * 0.34f, h * 0.58f))
+        drawCircle(color, w * 0.27f, Offset(w * 0.56f, h * 0.46f))
+        drawCircle(color, w * 0.18f, Offset(w * 0.78f, h * 0.62f))
+        drawRoundRect(color, Offset(w * 0.14f, h * 0.58f), Size(w * 0.80f, h * 0.24f), CornerRadius(h * 0.12f))
+    }
+}
+
+/** "12 s ago", "4 min ago", "3 h ago". */
+fun ago(ms: Long): String {
+    val s = (ms / 1000).coerceAtLeast(0)
+    return when {
+        s < 60 -> "$s s ago"
+        s < 3600 -> "${s / 60} min ago"
+        s < 86400 -> "${s / 3600} h ago"
+        else -> "${s / 86400} d ago"
+    }
+}

@@ -1,0 +1,18 @@
+{
+  "rules": {
+    "house":    { ".read": true, ".write": true },
+    "commands": { ".read": true, ".write": true },
+
+    "hbrt": {
+      "$key": {
+        ".read":  "$key.length >= 16",
+        ".write": "$key.length >= 16",
+        "in": {
+          "cmd": {
+            "$id": { ".validate": "newData.child('device').isString()" }
+          }
+        }
+      }
+    }
+  }
+}

@@ -615,6 +615,7 @@ fun ConfigTab(r: Reading?) {
     var aiUrl by rememberSaveable { mutableStateOf(Prefs.aiUrl) }
     var aiModel by rememberSaveable { mutableStateOf(Prefs.aiModel) }
     val modern = r?.modern == true
+    val via by GreenhouseClient.via.collectAsStateWithLifecycle()
 
     fun save() {
         val l = Limits(
@@ -714,8 +715,11 @@ fun ConfigTab(r: Reading?) {
             }
         }
 
-        SectionCard("Connection", GreenhouseClient.url) {
-            if (r != null) Text("Board ${r.id.ifBlank { "unknown" }}   ·   firmware ${r.fw}   ·   Wi-Fi ${r.rssi} dBm", color = Muted, fontSize = 12.sp)
+        RemoteAccessCard(r)
+
+        SectionCard("Connection", if (via == Via.CLOUD) "Through the cloud (${GreenhouseClient.cloud?.db ?: ""})" else GreenhouseClient.url) {
+            if (r != null) Text("Board ${r.id.ifBlank { "unknown" }}   ·   firmware ${r.fw}   ·   Wi-Fi ${r.rssi} dBm" +
+                (if (r.ip.isNotEmpty()) "   ·   ${r.ip}" else ""), color = Muted, fontSize = 12.sp)
             SecondaryButton("Switch greenhouse", color = Neon) { leaveGreenhouse(ctx) }
         }
 
@@ -723,9 +727,81 @@ fun ConfigTab(r: Reading?) {
             LeafMark(Modifier.size(40.dp))
             Spacer(Modifier.height(8.dp))
             Brand(22, "Agro")
-            Text("Smart Greenhouse  ·  version 4.0", color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp, bottom = 14.dp))
+            Text("Smart Greenhouse  ·  version 5.0", color = Muted, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp, bottom = 14.dp))
             Credits()
         }
+    }
+}
+
+/** Control from anywhere: share link, web dashboard, new private key. */
+@Composable
+fun RemoteAccessCard(r: Reading?) {
+    val ctx = LocalContext.current
+    val via by GreenhouseClient.via.collectAsStateWithLifecycle()
+    val ref = GreenhouseClient.cloud
+    var rekey by remember { mutableStateOf(false) }
+    if (ref == null || r == null || r.key.isEmpty() && via != Via.CLOUD) {
+        SectionCard("Control from anywhere", "Needs firmware 5.0 on the ESP32") {
+            Text(
+                "Flash firmware/hbrt_greenhouse/hbrt_greenhouse.ino (v5.0). Then connect once on the same Wi-Fi " +
+                    "and this greenhouse works from any network, no tunnel needed.",
+                color = Muted, fontSize = 13.sp
+            )
+        }
+        return
+    }
+    SectionCard("Control from anywhere", "Works on mobile data or any Wi-Fi, through Firebase") {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            CloudIcon(if (r.cloud || via == Via.CLOUD) Blue else Orange, Modifier.size(22.dp))
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    when {
+                        via == Via.CLOUD -> "Connected through the cloud"
+                        r.cloud -> "Ready: the board is online"
+                        else -> "The board can't reach the cloud yet"
+                    },
+                    color = TextC, fontSize = 15.sp, fontWeight = FontWeight.Bold
+                )
+                Text(
+                    if (via == Via.WIFI) "When you leave this Wi-Fi the app switches to the cloud by itself."
+                    else "Back on the greenhouse Wi-Fi, the app switches to the faster local link.",
+                    color = Muted, fontSize = 12.sp
+                )
+            }
+        }
+        PrimaryButton("Share access link") {
+            val send = android.content.Intent(android.content.Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(android.content.Intent.EXTRA_SUBJECT, "HBRT greenhouse: ${r.name}")
+                putExtra(
+                    android.content.Intent.EXTRA_TEXT,
+                    "Open \"${r.name}\" from anywhere: ${ref.shareLink()}\n\nIn the HBRT AGRO app: Add with a share link, then paste this."
+                )
+            }
+            ctx.startActivity(android.content.Intent.createChooser(send, "Share access"))
+        }
+        SecondaryButton("Open the web dashboard", color = Blue) {
+            ctx.startActivity(android.content.Intent(android.content.Intent.ACTION_VIEW, android.net.Uri.parse(ref.shareLink())))
+        }
+        Text("Anyone with the link can control this greenhouse. Share it only with your team.", color = Muted, fontSize = 12.sp)
+        TextButton(onClick = { rekey = true }, enabled = via == Via.WIFI) {
+            Text(if (via == Via.WIFI) "Make a new private link (old links stop working)" else "New private link: connect on Wi-Fi first", color = if (via == Via.WIFI) Orange else Muted, fontSize = 13.sp)
+        }
+    }
+    if (rekey) {
+        AlertDialog(
+            onDismissRequest = { rekey = false },
+            title = { Text("Make a new private link?") },
+            text = { Text("Every phone and browser using the old link loses access. This phone gets the new one automatically.") },
+            confirmButton = {
+                TextButton(onClick = {
+                    rekey = false
+                    toast(ctx, if (GreenhouseClient.newCloudKey()) "New link created" else "Connect on the greenhouse Wi-Fi first")
+                }) { Text("Make new link", color = Orange) }
+            },
+            dismissButton = { TextButton(onClick = { rekey = false }) { Text("Cancel") } }
+        )
     }
 }
 

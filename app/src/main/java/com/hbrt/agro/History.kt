@@ -36,6 +36,24 @@ object History {
         db.insertWithOnConflict("readings", null, v, SQLiteDatabase.CONFLICT_REPLACE)
     }
 
+    /** Adds [samples] only where the phone has nothing within 2 minutes (e.g. points from the cloud log). */
+    fun fillGaps(samples: List<Sample>) {
+        if (samples.isEmpty()) return
+        db.beginTransaction()
+        try {
+            samples.forEach { s ->
+                val near = db.rawQuery(
+                    "SELECT 1 FROM readings WHERE ts BETWEEN ? AND ? LIMIT 1",
+                    arrayOf((s.ts - 120_000).toString(), (s.ts + 120_000).toString())
+                ).use { it.moveToFirst() }
+                if (!near) add(s)
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
     fun since(from: Long): List<Sample> {
         val out = ArrayList<Sample>()
         db.rawQuery(

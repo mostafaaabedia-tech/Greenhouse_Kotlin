@@ -71,6 +71,11 @@ data class Reading(
     val timeOk: Boolean,
     val watering: Int,
     val limits: Limits?,
+    /** Firmware 5.0+: local IP, cloud database host + private key, and whether the cloud link works. */
+    val ip: String = "",
+    val db: String = "",
+    val key: String = "",
+    val cloud: Boolean = false,
 ) {
     companion object {
         fun parse(text: String): Reading? = try {
@@ -113,6 +118,10 @@ data class Reading(
                             it.optInt("lightOff", 1200),
                         )
                     },
+                    ip = j.optString("ip", ""),
+                    db = j.optString("db", ""),
+                    key = j.optString("key", ""),
+                    cloud = j.optBoolean("cloud", false),
                 )
             }
         } catch (e: Exception) {
@@ -207,8 +216,11 @@ fun fmtMinutes(m: Int): String = String.format(Locale.US, "%02d:%02d", (m / 60) 
 
 fun Float.f1(): String = String.format(Locale.US, "%.1f", this)
 
-/** A greenhouse the user has saved. */
-data class SavedGh(val name: String, val addr: String, val id: String = "")
+/** A greenhouse the user has saved. [cloud] = "key@db" once paired (firmware 5.0+). */
+data class SavedGh(val name: String, val addr: String, val id: String = "", val cloud: String = "") {
+    val hasCloud get() = cloud.isNotEmpty()
+    val cloudOnly get() = addr.startsWith("cloud:")
+}
 
 object Prefs {
     private lateinit var sp: SharedPreferences
@@ -249,24 +261,28 @@ object Prefs {
             val a = JSONArray(sp.getString("greenhouses", "[]"))
             List(a.length()) { i ->
                 val o = a.getJSONObject(i)
-                SavedGh(o.optString("name"), o.optString("addr"), o.optString("id"))
+                SavedGh(o.optString("name"), o.optString("addr"), o.optString("id"), o.optString("cloud"))
             }
         } catch (e: Exception) {
             emptyList()
         }
         set(v) {
             val a = JSONArray()
-            v.forEach { a.put(JSONObject().put("name", it.name).put("addr", it.addr).put("id", it.id)) }
+            v.forEach { a.put(JSONObject().put("name", it.name).put("addr", it.addr).put("id", it.id).put("cloud", it.cloud)) }
             sp.edit().putString("greenhouses", a.toString()).apply()
         }
 
-    /** Adds or updates a greenhouse (matched by board id, then by address). */
+    /** Adds or updates a greenhouse (matched by board id, then cloud key, then address). */
     fun saveGreenhouse(g: SavedGh) {
         val list = greenhouses.toMutableList()
-        val i = list.indexOfFirst { (g.id.isNotEmpty() && it.id == g.id) || it.addr.equals(g.addr, true) }
+        val i = list.indexOfFirst {
+            (g.id.isNotEmpty() && it.id == g.id) || (g.cloud.isNotEmpty() && it.cloud == g.cloud) || it.addr.equals(g.addr, true)
+        }
         if (i >= 0) {
             val old = list[i]
-            list[i] = SavedGh(g.name.ifBlank { old.name }, g.addr, g.id.ifBlank { old.id })
+            // never downgrade a Wi-Fi address to cloud-only: keep the IP so local stays fastest
+            val addr = if (g.addr.startsWith("cloud:") && !old.addr.startsWith("cloud:")) old.addr else g.addr
+            list[i] = SavedGh(g.name.ifBlank { old.name }, addr, g.id.ifBlank { old.id }, g.cloud.ifBlank { old.cloud })
         } else list += g
         greenhouses = list
     }
