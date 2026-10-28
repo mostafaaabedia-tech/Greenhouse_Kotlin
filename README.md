@@ -1,61 +1,83 @@
-# HBRT AGRO – Smart Greenhouse (native Kotlin)
+# HBRT AGRO – Smart Greenhouse
 
-Developed by **Mostafa Mesbah Aabedi** and **Milad Ahmadi**.
+Developed by **Mostafa Mesbah Aabedi** and **Milad Ahmadi** (HBRT, Herat Boys Robotic Team).
 
-Native Android app (Kotlin + Jetpack Compose) for the HBRT ESP32 greenhouse, plus the ESP32 firmware.
+Native Android app (Kotlin + Jetpack Compose) and ESP32 firmware for the HBRT smart greenhouse.
+The web dashboard lives in [HBRT-AGRO](https://github.com/mostafaaabedia-tech/HBRT-AGRO)
+(<https://mostafaaabedia-tech.github.io/HBRT-AGRO/>).
 
-## New in 5.0: control from anywhere, no tunnel
-The board talks to a **Firebase Realtime Database** over plain HTTPS. No Cloudflare tunnel, no port
-forwarding, no mixed-content problems.
+## New in 6.0
+**A new look.** The "Night Garden" design: a living plant inside glowing rings (air, humidity, soil, tank)
+under a sky that follows the time of day and the real weather. It droops when the soil is dry, flowers and
+fruits as it grows, and drinks while the pump runs. Light and dark themes, colourful device buttons,
+new icons and animations. English, Dari and Pashto, right-to-left where needed.
 
-- **Wi-Fi first, cloud automatically.** On the greenhouse Wi-Fi the app uses the fast local WebSocket.
-  Leave the Wi-Fi (mobile data, school, home) and it switches to the cloud by itself, then back again.
-- **Pairing is automatic.** Each board makes its own private key. The first time a phone connects on the
-  same Wi-Fi it saves the key; from then on it works from any network.
-- **Share with your team.** Settings → *Control from anywhere* → *Share access link*. The link opens the
-  web dashboard (<https://mostafaaabedia-tech.github.io/HBRT-AGRO/>) or can be pasted into the app on
-  another phone (*Add with a share link*).
-- **Fast and light.** Commands arrive in about a second. The board only sends every 2 s while someone
-  is watching and every 20 s otherwise, so the free Firebase plan is plenty.
-- **7-day history in the cloud** (one point every 5 minutes). The app fills gaps in its own history with it.
-- **Safe.** Commands older than 60 s are ignored (no surprise pump runs after an outage); all the 4.0
-  safety rules (tank empty, pump max run, cool-down) still run on the board.
-- **Real clock from the internet**, so the grow-light schedule keeps working after a power cut.
+**Control**
+- Modes: **Automatic**, **Manual** and **Away** (saves water and power while you're gone, plants stay safe).
+- Tap a device in automatic mode to keep it on or off for 15 min, 30 min, 1 hour or until you change it.
+  The board then goes back to automatic by itself. "Return now" undoes it.
+- **Hold to water**: the longer you hold, the longer it waters. Quick 5–60 s buttons too.
+- **Watering times** (up to 4 a day, per weekday), skipped automatically when rain is forecast.
+- **Your own rules**: "if soil below 35 % then pump on", up to 6.
+- **All off** with confirmation.
 
-### Setup
-1. Flash `firmware/hbrt_greenhouse/hbrt_greenhouse.ino` (v5.0). Set your Wi-Fi name/password at the top.
-   `FIREBASE_HOST` already points at the HBRT database (same one as the air-quality project).
-   Libraries: DHT sensor library, ESP32Servo, U8g2, OneWire, DallasTemperature, ArduinoJson, WebSockets
-   (Markus Sattler). No Firebase library needed. Board: ESP32 Dev Module (package 2.x or 3.x).
-2. Open the app on the greenhouse Wi-Fi and connect once. The OLED shows `WEB` when the cloud link works.
-3. Recommended: in the Firebase console → Realtime Database → Rules, paste `firebase-rules.json`.
-   It keeps the air-quality paths working and stops anyone from listing all greenhouses.
+**Knowing what happens**
+- **Timeline**: every switch with the reason ("Fan on · Automatic: air reached 31 °C").
+- **Weather** for your location (Open-Meteo, no key needed), frost warning, rain skip.
+- **Growth**: pick the crop and planting date. Growing-degree-days give the stage and a harvest date;
+  limits can follow the stage automatically.
+- **Water and power** used per day, and how many days the tank lasts.
+- **Air dryness (VPD)** and **dew point**, range bars that show where each value sits.
+- **History**: 1 h to all, compare with yesterday, hour-by-day heatmap, CSV/PDF export, alert history.
+- **Journal** shared by the team: notes, photos and harvests (grams), stored in the cloud.
 
-Database layout, all under one private key: `/hbrt/<key>/state` (live), `/in/cmd` (commands),
-`/in/seen` (someone is watching), `/log` (7-day history).
+**Alerts**
+- **Telegram bot**: alerts and commands (`/status`, `/water 10`, `/away`, `/auto`…) even with the app closed.
+- Pick which problems alert you, quiet hours at night (empty tank and frost still come through),
+  daily summary at 20:00.
+- Phone notifications from the background monitor, and a **home-screen widget** with a water button.
 
-## Build the APK with GitHub
-1. Push to `main`.
-2. Open the **Actions** tab, wait for "Build HBRT Kotlin App" to finish.
-3. Download **HBRT-AGRO-Kotlin** from the run, unzip, and install `app-debug.apk`.
+**Board**
+- **Firmware update from the app or website** (downloads the latest GitHub release), or upload a `.bin`
+  over Wi-Fi.
+- **Wi-Fi setup without re-flashing**: hold BOOT for 3 s (or the board can't find its Wi-Fi for 60 s)
+  and it opens the hotspot `HBRT-Setup-xxxx`. Join it and pick your network.
+- **Sensor calibration** from the app (dry/wet soil, empty/full tank).
+- Board health: signal, memory, restart reason, Wi-Fi drops, cloud errors.
+- **View-only link** for parents, teachers or judges, and an exhibition mode with QR code on the website.
+
+The camera and AI-camera ideas were left out on purpose. The AI assistant in the app still talks to
+your own Ollama server on the local network.
+
+## Setup
+1. **Flash the firmware** `firmware/hbrt_greenhouse/` (open `hbrt_greenhouse.ino`; the other `.ino`
+   files are tabs of the same sketch).
+   - Board: *ESP32 Dev Module*, Arduino core 3.x. Partition scheme: **Minimal SPIFFS (1.9 MB APP with OTA)**
+     so wireless updates have room. (The default scheme also fits today.)
+   - Libraries: ArduinoJson 7, WebSockets (Markus Sattler), DHT sensor library, OneWire,
+     DallasTemperature, ESP32Servo, U8g2.
+   - Wi-Fi: change the name/password at the top, or leave them and use the setup hotspot after flashing.
+   - After this first flash, later versions install from the app: *Settings → Board → Update firmware*.
+2. **Open the app** on the greenhouse Wi-Fi and connect once. From then on it works from anywhere.
+3. **Firebase rules** (recommended): paste `firebase-rules.json` in the Firebase console →
+   Realtime Database → Rules.
+4. **Telegram** (optional): in Telegram open @BotFather, send `/newbot`, copy the token, paste it in
+   *Settings → Telegram*, then press Start in your new bot.
+
+Database layout under each private key `/hbrt/<key>/`: `live/{s,cfg,wx,use,ev}` (state, settings,
+weather, usage, timeline), `in/cmd` and `in/seen` (commands, someone watching), `log` (7-day history),
+`journal` and `photos`. A view-only copy lives under its own `gv…` key.
+
+## Get the APK and firmware
+Every push to `main` builds both on GitHub Actions and publishes them as the **latest release**:
+`HBRT-AGRO.apk` and `hbrt_greenhouse.bin`. The board's update button downloads that `.bin`.
 
 ## Build on a PC
 Open the folder in Android Studio (Koala or newer) and press Run.
 
-## Features
-- Finds greenhouses on your Wi-Fi or phone hotspot automatically; save several and switch between them
-- Works from anywhere through the cloud (firmware 5.0), with automatic Wi-Fi ↔ cloud switching
-- Name each greenhouse (stored on the ESP32)
-- Plant health score, plain-language status, animated device icons, live water tank
-- Crop presets (tomato, cucumber, pepper, lettuce, strawberry, herbs)
-- Water now (5–60 s) and grow-light schedule
-- Live dashboard: gauges, live charts, Wi-Fi signal, uptime, active alerts
-- Controls: auto/manual, fan, pump, lights, heater, vent, "turn everything off"
-- Stable connection: pings, dead-link watchdog, auto-reconnect with back-off, instant reconnect when the
-  network returns, local IPs routed over Wi-Fi, follows the board to a new IP
-- Background monitoring (foreground service): logging and alert notifications with the app closed
-- History stored on the phone (SQLite, 6 months), ranges 1 h / 24 h / 7 d / 30 d / all
-- Export CSV and PDF (summary, chart, table), share or save anywhere
-- Optional daily PDF report saved to Downloads/HBRT at 20:00
-- Edit the greenhouse limits from the app (saved on the ESP32)
-- Local AI (Ollama): ask, diagnose, predict harvest
+UI text for the app and website comes from one file: edit `tools/i18n/strings.py`, then run
+`python3 tools/i18n/build.py` (writes `app/src/main/res/values*/strings.xml` and the website's `i18n.js`).
+
+## Licences
+Fonts in `app/src/main/res/font`: Space Grotesk, Oswald and Vazirmatn, all under the SIL Open Font
+License 1.1 (from the google/fonts repository).

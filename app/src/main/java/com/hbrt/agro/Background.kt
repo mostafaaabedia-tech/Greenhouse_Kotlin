@@ -44,6 +44,9 @@ class App : Application() {
     }
 }
 
+/** Strings in the language picked in the app (also for notifications made in the background). */
+fun Context.tr(id: Int, vararg args: Any): String = Lang.wrap(this).getString(id, *args)
+
 object Notifier {
     private const val CH_STATUS = "status"
     private const val CH_ALERTS = "alerts"
@@ -54,16 +57,28 @@ object Notifier {
     fun init(c: Context) {
         if (Build.VERSION.SDK_INT >= 26) {
             val nm = c.getSystemService(NotificationManager::class.java)
+            nm.createNotificationChannel(NotificationChannel(CH_STATUS, c.tr(R.string.n_ch_status), NotificationManager.IMPORTANCE_LOW))
             nm.createNotificationChannel(
-                NotificationChannel(CH_STATUS, "Greenhouse status", NotificationManager.IMPORTANCE_LOW)
-            )
-            nm.createNotificationChannel(
-                NotificationChannel(CH_ALERTS, "Greenhouse alerts", NotificationManager.IMPORTANCE_HIGH).apply {
+                NotificationChannel(CH_ALERTS, c.tr(R.string.n_ch_alerts), NotificationManager.IMPORTANCE_HIGH).apply {
                     enableVibration(true)
                     vibrationPattern = longArrayOf(0, 300, 150, 300)
                 }
             )
         }
+    }
+
+    /** The sentence for an alert, in the app's language. */
+    fun alertText(c: Context, key: String, r: Reading, wx: Wx?): String = when (key) {
+        "hot" -> c.tr(R.string.al_hot, r.temperature.f1())
+        "cold" -> c.tr(R.string.al_cold, r.temperature.f1())
+        "humid" -> c.tr(R.string.al_humid, r.humidity.f0())
+        "dry" -> c.tr(R.string.al_dry, r.soil)
+        "tank" -> c.tr(R.string.al_tank)
+        "lock" -> c.tr(R.string.al_lock)
+        "dht" -> c.tr(R.string.al_dht)
+        "st" -> c.tr(R.string.al_st)
+        "frost" -> c.tr(R.string.al_frost, wx?.days?.getOrNull(1)?.min?.f0() ?: "--")
+        else -> key
     }
 
     private fun openApp(c: Context): PendingIntent = PendingIntent.getActivity(
@@ -76,8 +91,8 @@ object Notifier {
         ContextCompat.checkSelfPermission(c, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 
     fun status(c: Context, text: String): Notification = NotificationCompat.Builder(c, CH_STATUS)
-        .setSmallIcon(android.R.drawable.ic_menu_info_details)
-        .setContentTitle("HBRT AGRO monitoring")
+        .setSmallIcon(R.drawable.ic_leaf)
+        .setContentTitle(c.tr(R.string.n_status_title))
         .setContentText(text)
         .setOngoing(true)
         .setOnlyAlertOnce(true)
@@ -90,11 +105,11 @@ object Notifier {
     }
 
     @SuppressLint("MissingPermission")
-    fun alert(c: Context, msg: String) {
+    fun alert(c: Context, title: String, msg: String) {
         if (!allowed(c)) return
         val n = NotificationCompat.Builder(c, CH_ALERTS)
-            .setSmallIcon(android.R.drawable.stat_sys_warning)
-            .setContentTitle("Greenhouse alert")
+            .setSmallIcon(R.drawable.ic_leaf)
+            .setContentTitle(title.ifBlank { c.tr(R.string.n_alert_title) })
             .setContentText(msg)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setAutoCancel(true)
@@ -107,8 +122,8 @@ object Notifier {
     fun report(c: Context, msg: String) {
         if (!allowed(c)) return
         val n = NotificationCompat.Builder(c, CH_STATUS)
-            .setSmallIcon(android.R.drawable.ic_menu_save)
-            .setContentTitle("Daily greenhouse report")
+            .setSmallIcon(R.drawable.ic_leaf)
+            .setContentTitle(c.tr(R.string.n_report_title))
             .setContentText(msg)
             .setAutoCancel(true)
             .setContentIntent(openApp(c))
@@ -118,8 +133,8 @@ object Notifier {
 }
 
 /**
- * Foreground service: keeps the WebSocket alive with the screen off or the app closed,
- * so readings keep being logged and alerts still arrive.
+ * Foreground service: keeps the connection (Wi-Fi or cloud) alive with the screen off or the app
+ * closed, so readings keep being logged and alerts still arrive.
  */
 class MonitorService : Service() {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
@@ -130,12 +145,9 @@ class MonitorService : Service() {
     @Suppress("DEPRECATION")
     override fun onCreate() {
         super.onCreate()
-        val n = Notifier.status(this, "Connecting…")
-        if (Build.VERSION.SDK_INT >= 29) {
-            startForeground(Notifier.ID_SERVICE, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
-        } else {
-            startForeground(Notifier.ID_SERVICE, n)
-        }
+        val n = Notifier.status(this, tr(R.string.n_connecting))
+        if (Build.VERSION.SDK_INT >= 29) startForeground(Notifier.ID_SERVICE, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
+        else startForeground(Notifier.ID_SERVICE, n)
         val wm = applicationContext.getSystemService(Context.WIFI_SERVICE) as WifiManager
         wifiLock = wm.createWifiLock(WifiManager.WIFI_MODE_FULL_HIGH_PERF, "hbrt:ws").apply {
             setReferenceCounted(false)
@@ -150,7 +162,6 @@ class MonitorService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        // Restarted by Android after being killed: reconnect on our own.
         if (GreenhouseClient.link.value == Link.IDLE && Prefs.autoConnect && Prefs.lastAddress.isNotBlank()) {
             GreenhouseClient.connect(Prefs.lastAddress, persistent = true)
         }
@@ -159,11 +170,12 @@ class MonitorService : Service() {
 
     private fun statusText(): String {
         val r = GreenhouseClient.latest.value
+        val n = GreenhouseClient.activeAlerts.value.size
         return when {
-            GreenhouseClient.link.value != Link.ONLINE -> "Connection lost, reconnecting…"
-            r == null -> "Waiting for data…"
-            else -> "${r.temperature.f1()}°C   ${r.humidity.toInt()}% hum   soil ${r.soil}%   tank ${r.water}%" +
-                if (GreenhouseClient.activeAlerts.value.isNotEmpty()) "   ⚠ ${GreenhouseClient.activeAlerts.value.size} alert(s)" else ""
+            GreenhouseClient.link.value != Link.ONLINE -> tr(R.string.n_lost)
+            r == null -> tr(R.string.n_waiting)
+            else -> "${r.temperature.f1()}°C   ${r.humidity.f0()}%   ${tr(R.string.m_soil)} ${r.soil}%   ${tr(R.string.m_tank)} ${r.water}%" +
+                if (n > 0) "   ⚠ ${tr(R.string.n_alerts_n, n)}" else ""
         }
     }
 
@@ -175,9 +187,7 @@ class MonitorService : Service() {
 
     companion object {
         fun start(c: Context) = ContextCompat.startForegroundService(c, Intent(c, MonitorService::class.java))
-        fun stop(c: Context) {
-            c.stopService(Intent(c, MonitorService::class.java))
-        }
+        fun stop(c: Context) { c.stopService(Intent(c, MonitorService::class.java)) }
     }
 }
 
@@ -186,15 +196,14 @@ class ReportWorker(c: Context, p: WorkerParameters) : CoroutineWorker(c, p) {
     override suspend fun doWork(): Result {
         val data = History.since(System.currentTimeMillis() - 86_400_000L)
         if (data.isEmpty()) return Result.success()
-        val f = Exporter.pdf(applicationContext, data, "Last 24 hours")
+        val f = Exporter.pdf(applicationContext, data, "24 h")
         val saved = Exporter.saveToDownloads(applicationContext, f, "application/pdf")
-        Notifier.report(applicationContext, if (saved) "Saved ${f.name} to Downloads/HBRT" else "Report created (open the app to share it)")
+        Notifier.report(applicationContext, if (saved) applicationContext.tr(R.string.n_report_saved, f.name) else applicationContext.tr(R.string.n_report_made))
         return Result.success()
     }
 
     companion object {
         private const val NAME = "daily_report"
-
         fun schedule(c: Context) {
             val next = Calendar.getInstance().apply {
                 set(Calendar.HOUR_OF_DAY, 20); set(Calendar.MINUTE, 0); set(Calendar.SECOND, 0)
@@ -205,9 +214,6 @@ class ReportWorker(c: Context, p: WorkerParameters) : CoroutineWorker(c, p) {
                 .build()
             WorkManager.getInstance(c).enqueueUniquePeriodicWork(NAME, ExistingPeriodicWorkPolicy.UPDATE, req)
         }
-
-        fun cancel(c: Context) {
-            WorkManager.getInstance(c).cancelUniqueWork(NAME)
-        }
+        fun cancel(c: Context) { WorkManager.getInstance(c).cancelUniqueWork(NAME) }
     }
 }

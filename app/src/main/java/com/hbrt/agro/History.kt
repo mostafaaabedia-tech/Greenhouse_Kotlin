@@ -13,16 +13,22 @@ object History {
         db = Helper(c).writableDatabase
     }
 
-    private class Helper(c: Context) : SQLiteOpenHelper(c, "hbrt.db", null, 1) {
+    private class Helper(c: Context) : SQLiteOpenHelper(c, "hbrt.db", null, 2) {
         override fun onCreate(d: SQLiteDatabase) {
             d.execSQL(
                 "CREATE TABLE readings(ts INTEGER PRIMARY KEY, t REAL, h REAL, s INTEGER, st REAL, w INTEGER, " +
                     "fan INTEGER, pump INTEGER, lights INTEGER, heater INTEGER, vent INTEGER)"
             )
             d.execSQL("CREATE TABLE alerts(id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, msg TEXT)")
+            onUpgrade(d, 1, 2)
         }
 
-        override fun onUpgrade(d: SQLiteDatabase, oldV: Int, newV: Int) {}
+        override fun onUpgrade(d: SQLiteDatabase, oldV: Int, newV: Int) {
+            if (oldV < 2) d.execSQL(
+                "CREATE TABLE IF NOT EXISTS events(id TEXT PRIMARY KEY, board TEXT, ts INTEGER, c TEXT, d TEXT, byw TEXT, w TEXT, " +
+                    "a TEXT, m TEXT, st TEXT, v INTEGER, x REAL)"
+            )
+        }
     }
 
     private fun Boolean.i() = if (this) 1 else 0
@@ -73,6 +79,7 @@ object History {
     fun prune(olderThan: Long) {
         db.delete("readings", "ts<?", arrayOf(olderThan.toString()))
         db.delete("alerts", "ts<?", arrayOf(olderThan.toString()))
+        db.delete("events", "ts<?", arrayOf(olderThan.toString()))
     }
 
     fun logAlert(msg: String) {
@@ -89,5 +96,32 @@ object History {
 
     fun clearAlerts() {
         db.delete("alerts", null, null)
+    }
+
+    /** Keeps the board's timeline on the phone, so it goes further back than the board's last 40 events. */
+    fun addEvents(board: String, list: List<Ev>) {
+        if (!::db.isInitialized) return
+        db.beginTransaction()
+        try {
+            list.filter { it.t > 0 }.forEach { e ->
+                val v = ContentValues().apply {
+                    put("id", "$board:${e.t}:${e.c}:${e.d}:${e.v}"); put("board", board); put("ts", e.t); put("c", e.c); put("d", e.d)
+                    put("byw", e.by); put("w", e.w); put("a", e.a); put("m", e.m); put("st", e.st); put("v", e.v); put("x", e.x)
+                }
+                db.insertWithOnConflict("events", null, v, SQLiteDatabase.CONFLICT_IGNORE)
+            }
+            db.setTransactionSuccessful()
+        } finally {
+            db.endTransaction()
+        }
+    }
+
+    fun events(board: String, limit: Int = 300): List<Ev> {
+        val out = ArrayList<Ev>()
+        db.rawQuery("SELECT ts,c,d,byw,w,a,m,st,v,x FROM events WHERE board=? ORDER BY ts DESC LIMIT $limit", arrayOf(board)).use { c ->
+            while (c.moveToNext()) out += Ev(c.getLong(0), c.getLong(0), c.getString(1), c.getString(2), c.getString(3), c.getString(4),
+                c.getString(5), c.getString(6), c.getString(7), c.getInt(8), c.getFloat(9))
+        }
+        return out
     }
 }

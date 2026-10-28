@@ -5,151 +5,113 @@ import android.content.SharedPreferences
 import org.json.JSONArray
 import org.json.JSONObject
 import java.util.Locale
+import kotlin.math.exp
+import kotlin.math.ln
+import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-/** Limits stored on the ESP32 and editable from the app. */
-data class Limits(
-    val tempMax: Float = 35f,
-    val tempMin: Float = 15f,
-    val humMax: Float = 60f,
-    val soilMin: Int = 30,
-    val waterMin: Int = 5,
-    val pumpMax: Int = 60,
-    val lightSched: Boolean = false,
-    val lightOn: Int = 6 * 60,
-    val lightOff: Int = 20 * 60,
-) {
-    fun toJson(): String = JSONObject()
-        .put("device", "config")
-        .put("tempMax", tempMax.toDouble())
-        .put("tempMin", tempMin.toDouble())
-        .put("humMax", humMax.toDouble())
-        .put("soilMin", soilMin)
-        .put("waterMin", waterMin)
-        .put("pumpMax", pumpMax)
-        .put("lightSched", lightSched)
-        .put("lightOn", lightOn)
-        .put("lightOff", lightOff)
-        .toString()
-}
+/* =================== Settings stored on the board =================== */
 
-/** Crop presets: fill in the limits with one tap. */
-data class Preset(val name: String, val tempMin: Float, val tempMax: Float, val humMax: Float, val soilMin: Int)
+data class Slot(val m: Int, val s: Int, val d: Int = 127)
+data class RuleC(val s: String = "S", val o: String = "<", val v: Float = 25f, val d: String = "pump", val on: Boolean = true)
+data class Cal(val soilDry: Int = 4095, val soilWet: Int = 0, val waterEmpty: Int = 0, val waterFull: Int = 4095)
 
-val PRESETS = listOf(
-    Preset("Tomato", 18f, 30f, 75f, 40),
-    Preset("Cucumber", 20f, 32f, 80f, 50),
-    Preset("Pepper", 20f, 30f, 70f, 40),
-    Preset("Lettuce", 10f, 24f, 70f, 45),
-    Preset("Strawberry", 15f, 26f, 75f, 45),
-    Preset("Herbs", 16f, 28f, 65f, 35),
-)
-
-/** One live packet from the ESP32 (sent every 2 s). */
-data class Reading(
-    val ts: Long,
-    val name: String,
-    val id: String,
-    val fw: String,
-    val temperature: Float,
-    val humidity: Float,
-    val soil: Int,
-    val water: Int,
-    val soilTemp: Float,
-    val fan: Boolean,
-    val pump: Boolean,
-    val lights: Boolean,
-    val heater: Boolean,
-    val servo: Boolean,
-    val auto: Boolean,
-    val rssi: Int,
-    val uptime: Long,
-    val pumpLock: Boolean,
-    val dhtOk: Boolean,
-    val stOk: Boolean,
-    val timeOk: Boolean,
-    val watering: Int,
-    val limits: Limits?,
-    /** Firmware 5.0+: local IP, cloud database host + private key, and whether the cloud link works. */
-    val ip: String = "",
-    val db: String = "",
-    val key: String = "",
-    val cloud: Boolean = false,
+data class Cfg(
+    val tempMax: Float = 35f, val tempMin: Float = 15f, val humMax: Float = 60f,
+    val soilMin: Int = 30, val waterMin: Int = 5, val pumpMax: Int = 60,
+    val lightSched: Boolean = false, val lightOn: Int = 360, val lightOff: Int = 1200,
+    val flowMl: Int = 20, val tankL: Int = 20, val watt: Map<String, Int> = emptyMap(),
+    val crop: String = "", val plantDay: Int = 0, val autoStage: Boolean = false,
+    val lat: Double = 34.35, val lon: Double = 62.2, val rainSkip: Boolean = true, val frostAlert: Boolean = true,
+    val quiet: Boolean = true, val quietFrom: Int = 1320, val quietTo: Int = 420, val alertMask: Int = 511,
+    val dailySummary: Boolean = true, val lang: String = "en", val cal: Cal = Cal(),
+    val sched: List<Slot> = emptyList(), val rules: List<RuleC> = emptyList(),
+    val tgSet: Boolean = false, val tgChat: String = "",
 ) {
     companion object {
-        fun parse(text: String): Reading? = try {
-            val j = JSONObject(text)
-            if (!j.has("temperature")) null else {
-                val c = j.optJSONObject("cfg")
-                Reading(
-                    ts = System.currentTimeMillis(),
-                    name = j.optString("name", ""),
-                    id = j.optString("id", ""),
-                    fw = j.optString("fw", "3.x"),
-                    temperature = j.optDouble("temperature", 0.0).toFloat(),
-                    humidity = j.optDouble("humidity", 0.0).toFloat(),
-                    soil = j.optInt("soil"),
-                    water = j.optInt("water"),
-                    soilTemp = j.optDouble("soilTemp", 0.0).toFloat(),
-                    fan = j.optBoolean("fan"),
-                    pump = j.optBoolean("pump"),
-                    lights = j.optBoolean("lights"),
-                    heater = j.optBoolean("heater"),
-                    servo = j.optBoolean("servo"),
-                    auto = j.optBoolean("auto", true),
-                    rssi = j.optInt("rssi"),
-                    uptime = j.optLong("uptime"),
-                    pumpLock = j.optBoolean("pumpLock"),
-                    dhtOk = j.optBoolean("dhtOk", true),
-                    stOk = j.optBoolean("stOk", true),
-                    timeOk = j.optBoolean("timeOk", false),
-                    watering = j.optInt("watering", 0),
-                    limits = c?.let {
-                        Limits(
-                            it.optDouble("tempMax", 35.0).toFloat(),
-                            it.optDouble("tempMin", 15.0).toFloat(),
-                            it.optDouble("humMax", 60.0).toFloat(),
-                            it.optInt("soilMin", 30),
-                            it.optInt("waterMin", 5),
-                            it.optInt("pumpMax", 60),
-                            it.optBoolean("lightSched", false),
-                            it.optInt("lightOn", 360),
-                            it.optInt("lightOff", 1200),
-                        )
-                    },
-                    ip = j.optString("ip", ""),
-                    db = j.optString("db", ""),
-                    key = j.optString("key", ""),
-                    cloud = j.optBoolean("cloud", false),
-                )
-            }
-        } catch (e: Exception) {
-            null
+        fun parse(j: JSONObject?): Cfg? {
+            if (j == null) return null
+            val w = j.optJSONObject("watt")
+            val c = j.optJSONObject("cal")
+            val sa = j.optJSONArray("sched") ?: JSONArray()
+            val ra = j.optJSONArray("rules") ?: JSONArray()
+            return Cfg(
+                j.optDouble("tempMax", 35.0).toFloat(), j.optDouble("tempMin", 15.0).toFloat(), j.optDouble("humMax", 60.0).toFloat(),
+                j.optInt("soilMin", 30), j.optInt("waterMin", 5), j.optInt("pumpMax", 60),
+                j.optBoolean("lightSched"), j.optInt("lightOn", 360), j.optInt("lightOff", 1200),
+                j.optInt("flowMl", 20), j.optInt("tankL", 20),
+                w?.keys()?.asSequence()?.associateWith { w.optInt(it) } ?: emptyMap(),
+                j.optString("crop", ""), j.optInt("plantDay", 0), j.optBoolean("autoStage"),
+                j.optDouble("lat", 34.35), j.optDouble("lon", 62.2), j.optBoolean("rainSkip", true), j.optBoolean("frostAlert", true),
+                j.optBoolean("quiet", true), j.optInt("quietFrom", 1320), j.optInt("quietTo", 420), j.optInt("alertMask", 511),
+                j.optBoolean("dailySummary", true), j.optString("lang", "en"),
+                c?.let { Cal(it.optInt("soilDry", 4095), it.optInt("soilWet", 0), it.optInt("waterEmpty", 0), it.optInt("waterFull", 4095)) } ?: Cal(),
+                List(sa.length()) { sa.getJSONObject(it).let { o -> Slot(o.optInt("m"), o.optInt("s"), o.optInt("d", 127)) } },
+                List(ra.length()) { ra.getJSONObject(it).let { o -> RuleC(o.optString("s"), o.optString("o"), o.optDouble("v").toFloat(), o.optString("d"), o.optBoolean("on", true)) } },
+                j.optBoolean("tgSet"), j.optString("tgChat", ""),
+            )
         }
     }
+}
 
-    /** New firmware (4.0+) supports names, water-now and the light schedule. */
-    val modern: Boolean get() = id.isNotEmpty()
+/** Crop presets: min temp, max temp, max humidity, water below. Same numbers as the board. */
+data class Preset(val id: String, val tempMin: Float, val tempMax: Float, val humMax: Float, val soilMin: Int, val base: Float, val gdd: Float)
 
-    /** Active problems, keyed so each one is notified only once while it lasts. */
-    fun alerts(): Map<String, String> {
-        val l = limits ?: Limits()
-        val m = linkedMapOf<String, String>()
-        if (dhtOk && temperature > l.tempMax) m["hot"] = "Too hot: ${temperature.f1()}°C"
-        if (dhtOk && temperature < l.tempMin) m["cold"] = "Too cold: ${temperature.f1()}°C"
-        if (dhtOk && humidity > l.humMax) m["hum"] = "Humidity is high: ${humidity.roundToInt()}%"
-        if (soil < l.soilMin) m["soil"] = "Soil is dry: $soil%"
-        if (water <= l.waterMin) m["tank"] = "Water tank is empty"
-        if (pumpLock) m["lock"] = "Pump is resting after a long run"
-        if (!dhtOk) m["dht"] = "Air sensor is not responding"
-        if (!stOk) m["st"] = "Soil temperature sensor is not responding"
+val PRESETS = listOf(
+    Preset("tomato", 18f, 30f, 75f, 40, 10f, 1250f),
+    Preset("cucumber", 20f, 32f, 80f, 50, 10f, 850f),
+    Preset("pepper", 20f, 30f, 70f, 40, 10f, 1300f),
+    Preset("lettuce", 10f, 24f, 70f, 45, 4f, 900f),
+    Preset("strawberry", 15f, 26f, 75f, 45, 7f, 1100f),
+    Preset("herbs", 16f, 28f, 65f, 35, 10f, 700f),
+)
+val STAGES = listOf("seedling", "growing", "flowering", "fruiting", "harvest")
+val DEVICES = listOf("fan", "pump", "lights", "heater", "servo")
+val ALERTS = listOf("hot", "cold", "humid", "dry", "tank", "lock", "dht", "st", "frost")
+
+/* =================== Live readings =================== */
+
+data class Reading(
+    val ts: Long,
+    val name: String = "", val id: String = "", val fw: String = "",
+    val temperature: Float = 0f, val humidity: Float = 0f, val soil: Int = 0, val water: Int = 0, val soilTemp: Float = 0f,
+    val fan: Boolean = false, val pump: Boolean = false, val lights: Boolean = false, val heater: Boolean = false, val servo: Boolean = false,
+    val mode: String = "auto", val ovr: Map<String, Int> = emptyMap(),
+    val rssi: Int = 0, val uptime: Long = 0, val pumpLock: Boolean = false, val dhtOk: Boolean = true, val stOk: Boolean = true,
+    val timeOk: Boolean = false, val watering: Int = 0, val ip: String = "",
+    val al: List<String>? = null, val stage: String = "", val gdd: Float = 0f, val gddH: Float = 0f, val day: Int = -1,
+    val db: String = "", val key: String = "", val view: String = "", val cloud: Boolean = false, val ro: Boolean = false,
+    val rawS: Int = -1, val rawW: Int = -1, val heap: Int = 0, val resetReason: Int = 0, val drops: Int = 0, val cloudErrors: Int = 0,
+    val ota: String = "", val tg: String = "off", val portal: Boolean = false, val ssid: String = "",
+    /** Limits inside the packet (firmware 4.x / 5.x). */
+    val legacyCfg: Cfg? = null,
+) {
+    val auto get() = mode != "manual"
+    val modern get() = id.isNotEmpty()
+    val v6 get() = fw.substringBefore('.').toIntOrNull()?.let { it >= 6 } == true
+
+    fun on(d: String) = when (d) { "fan" -> fan; "pump" -> pump; "lights" -> lights; "heater" -> heater; else -> servo }
+
+    /** Active problems: board's own list (firmware 6) or worked out here for older boards. */
+    fun alerts(c: Cfg?): List<String> {
+        al?.let { return it }
+        val l = c ?: legacyCfg ?: Cfg()
+        val m = mutableListOf<String>()
+        if (dhtOk && temperature > l.tempMax) m += "hot"
+        if (dhtOk && temperature < l.tempMin) m += "cold"
+        if (dhtOk && humidity > l.humMax) m += "humid"
+        if (soil < l.soilMin) m += "dry"
+        if (water <= l.waterMin) m += "tank"
+        if (pumpLock) m += "lock"
+        if (!dhtOk) m += "dht"
+        if (!stOk) m += "st"
         return m
     }
 
     /** 0–100: how comfortable the plants are right now. */
-    fun health(): Int {
-        val l = limits ?: Limits()
+    fun health(c: Cfg?): Int {
+        val l = c ?: legacyCfg ?: Cfg()
         fun off(v: Float, lo: Float, hi: Float, span: Float) = when {
             v < lo -> min(1f, (lo - v) / span)
             v > hi -> min(1f, (v - hi) / span)
@@ -166,36 +128,121 @@ data class Reading(
         return s.coerceIn(0f, 100f).roundToInt()
     }
 
-    /** One plain sentence for the dashboard. */
-    fun summary(): String = when {
-        watering > 0 -> "Watering now, $watering s left"
-        alerts().isNotEmpty() -> alerts().values.first()
-        pump -> "Watering the plants"
-        fan && servo -> "Cooling down: fan on, vent open"
-        heater -> "Warming up the greenhouse"
-        else -> "Everything looks good"
-    }
-
     fun toSample() = Sample(ts, temperature, humidity, soil, soilTemp, water, fan, pump, lights, heater, servo)
+
+    companion object {
+        fun parse(j: JSONObject, ts: Long): Reading? {
+            if (!j.has("temperature")) return null
+            val ovr = j.optJSONObject("ovr")
+            val al = j.optJSONArray("al")
+            val raw = j.optJSONObject("raw")
+            val hp = j.optJSONObject("hp")
+            return Reading(
+                ts, j.optString("name"), j.optString("id"), j.optString("fw", "3.x"),
+                j.optDouble("temperature", 0.0).toFloat(), j.optDouble("humidity", 0.0).toFloat(), j.optInt("soil"), j.optInt("water"),
+                j.optDouble("soilTemp", 0.0).toFloat(),
+                j.optBoolean("fan"), j.optBoolean("pump"), j.optBoolean("lights"), j.optBoolean("heater"), j.optBoolean("servo"),
+                j.optString("mode", if (j.optBoolean("auto", true)) "auto" else "manual"),
+                ovr?.keys()?.asSequence()?.associateWith { ovr.optInt(it) } ?: emptyMap(),
+                j.optInt("rssi"), j.optLong("uptime"), j.optBoolean("pumpLock"), j.optBoolean("dhtOk", true), j.optBoolean("stOk", true),
+                j.optBoolean("timeOk"), j.optInt("watering"), j.optString("ip"),
+                al?.let { a -> List(a.length()) { a.getString(it) } },
+                j.optString("stage"), j.optDouble("gdd", 0.0).toFloat(), j.optDouble("gddH", 0.0).toFloat(), j.optInt("day", -1),
+                j.optString("db"), j.optString("key"), j.optString("view"), j.optBoolean("cloud"), j.optBoolean("ro"),
+                raw?.optInt("s", -1) ?: -1, raw?.optInt("w", -1) ?: -1,
+                hp?.optInt("heap") ?: 0, hp?.optInt("rr") ?: 0, hp?.optInt("drops") ?: 0, hp?.optInt("cerr") ?: 0,
+                j.optString("ota"), j.optString("tg", "off"), j.optBoolean("portal"), j.optString("ssid"),
+                Cfg.parse(j.optJSONObject("cfg")),
+            )
+        }
+    }
 }
 
-/** One row of logged history. */
+data class WxDay(val max: Float, val min: Float, val pp: Float, val ps: Float, val code: Int) {
+    val rain get() = ps >= 1f || pp >= 60f
+}
+data class Wx(val t: Long, val now: Float, val code: Int, val days: List<WxDay>, val rain: Boolean, val frost: Boolean) {
+    companion object {
+        fun parse(j: JSONObject?): Wx? {
+            val d = j?.optJSONArray("d") ?: return null
+            return Wx(
+                j.optLong("t"), j.optDouble("now").toFloat(), j.optInt("code"),
+                List(d.length()) { d.getJSONObject(it).let { o -> WxDay(o.optDouble("max").toFloat(), o.optDouble("min").toFloat(), o.optDouble("pp").toFloat(), o.optDouble("ps").toFloat(), o.optInt("code")) } },
+                j.optBoolean("rain"), j.optBoolean("frost"),
+            )
+        }
+    }
+}
+/** WMO weather code -> 0 clear, 1 partly cloudy, 2 cloudy, 3 fog, 4 drizzle, 5 rain, 6 snow, 7 showers, 8 storm */
+fun wxKind(c: Int) = when {
+    c == 0 -> 0; c <= 2 -> 1; c == 3 -> 2; c <= 48 -> 3; c <= 57 -> 4; c <= 67 -> 5; c <= 77 -> 6; c <= 82 -> 7; c <= 86 -> 6; else -> 8
+}
+
+data class UseDay(val d: Int, val l: Float, val kwh: Float)
+data class Use(val todayL: Float, val todayKwh: Float, val today: Int, val days: List<UseDay>) {
+    companion object {
+        fun parse(j: JSONObject?): Use? {
+            if (j == null) return null
+            val t = j.optJSONObject("today")
+            val d = j.optJSONArray("days") ?: JSONArray()
+            return Use(
+                t?.optDouble("L", 0.0)?.toFloat() ?: 0f, t?.optDouble("kWh", 0.0)?.toFloat() ?: 0f, t?.optInt("d") ?: 0,
+                List(d.length()) { d.getJSONObject(it).let { o -> UseDay(o.optInt("d"), o.optDouble("L").toFloat(), o.optDouble("kWh").toFloat()) } },
+            )
+        }
+    }
+}
+
+/** One timeline entry from the board. */
+data class Ev(
+    val n: Long, val t: Long, val c: String, val d: String, val by: String, val w: String,
+    val a: String, val m: String, val st: String, val v: Int, val x: Float,
+) {
+    companion object {
+        fun parse(o: JSONObject) = Ev(
+            o.optLong("n"), o.optLong("t"), o.optString("c"), o.optString("d"), o.optString("by", "system"), o.optString("w"),
+            o.optString("a"), o.optString("m"), o.optString("st"), o.optInt("v"), o.optDouble("x", 0.0).toFloat(),
+        )
+    }
+}
+
+/* =================== Growth =================== */
+
+data class Growth(val crop: String, val stage: String, val day: Int, val frac: Float, val totalDays: Int, val harvestAt: Long, val gdd: Float, val gddH: Float)
+
+fun growth(r: Reading, c: Cfg?): Growth? {
+    val p = PRESETS.firstOrNull { it.id == c?.crop } ?: return null
+    val gH = if (r.gddH > 0) r.gddH else p.gdd
+    val day = max(0, r.day)
+    val rate = if (day > 3 && r.gdd > 0) r.gdd / day else 12f
+    val left = max(0f, (gH - r.gdd) / max(1f, rate))
+    return Growth(p.id, r.stage.ifBlank { "seedling" }, day, (r.gdd / gH).coerceIn(0f, 1f), (day + left).roundToInt(),
+        System.currentTimeMillis() + (left * 86_400_000L).toLong(), r.gdd, gH)
+}
+
+/* =================== Climate maths =================== */
+
+/** Vapour pressure deficit in kPa: how strongly the air pulls water from the leaves. */
+fun vpd(t: Float, rh: Float): Float = (0.6108 * exp(17.27 * t / (t + 237.3)) * (1 - rh / 100.0)).toFloat()
+fun dewPoint(t: Float, rh: Float): Float {
+    val g = ln(max(1f, rh) / 100.0) + 17.62 * t / (243.12 + t)
+    return (243.12 * g / (17.62 - g)).toFloat()
+}
+fun vpdBand(stage: String) = when (stage) {
+    "seedling" -> 0.4f to 0.8f
+    "growing" -> 0.8f to 1.2f
+    "flowering", "fruiting" -> 1.0f to 1.5f
+    else -> 0.8f to 1.2f
+}
+
+/* =================== Phone history =================== */
+
 data class Sample(
-    val ts: Long,
-    val t: Float,
-    val h: Float,
-    val s: Int,
-    val st: Float,
-    val w: Int,
-    val fan: Boolean,
-    val pump: Boolean,
-    val lights: Boolean,
-    val heater: Boolean,
-    val vent: Boolean,
+    val ts: Long, val t: Float, val h: Float, val s: Int, val st: Float, val w: Int,
+    val fan: Boolean, val pump: Boolean, val lights: Boolean, val heater: Boolean, val vent: Boolean,
 )
 
 data class AlertEntry(val ts: Long, val msg: String)
-
 data class Stat3(val min: Float, val avg: Float, val max: Float)
 
 fun List<Float>.stat(): Stat3? = if (isEmpty()) null else Stat3(min(), average().toFloat(), max())
@@ -206,59 +253,65 @@ fun <T> List<T>.downsample(max: Int): List<T> =
         List(max) { this[(it * step).toInt()] }
     }
 
-fun fmtUptime(sec: Long): String {
-    val h = sec / 3600
-    val m = sec % 3600 / 60
-    return if (h >= 24) "${h / 24}d ${h % 24}h" else "${h}h ${m}m"
-}
-
 fun fmtMinutes(m: Int): String = String.format(Locale.US, "%02d:%02d", (m / 60) % 24, m % 60)
-
 fun Float.f1(): String = String.format(Locale.US, "%.1f", this)
+fun Float.f0(): String = String.format(Locale.US, "%.0f", this)
+fun Float.fx(d: Int): String = String.format(Locale.US, "%.${d}f", this)
+
+/* =================== Saved greenhouses + preferences =================== */
 
 /** A greenhouse the user has saved. [cloud] = "key@db" once paired (firmware 5.0+). */
 data class SavedGh(val name: String, val addr: String, val id: String = "", val cloud: String = "") {
     val hasCloud get() = cloud.isNotEmpty()
     val cloudOnly get() = addr.startsWith("cloud:")
+    val viewOnly get() = cloud.startsWith("gv") || addr.startsWith("cloud:gv")
 }
 
 object Prefs {
     private lateinit var sp: SharedPreferences
     fun init(c: Context) {
-        sp = c.getSharedPreferences("hbrt", Context.MODE_PRIVATE)
+        if (!::sp.isInitialized) sp = c.getSharedPreferences("hbrt", Context.MODE_PRIVATE)
     }
 
-    var lastAddress: String
-        get() = sp.getString("addr", "") ?: ""
-        set(v) = sp.edit().putString("addr", v).apply()
+    private fun str(k: String, d: String) = sp.getString(k, d) ?: d
 
+    var lastAddress: String
+        get() = str("addr", "")
+        set(v) = sp.edit().putString("addr", v).apply()
     var autoConnect: Boolean
         get() = sp.getBoolean("auto_connect", false)
         set(v) = sp.edit().putBoolean("auto_connect", v).apply()
-
     var aiUrl: String
-        get() = sp.getString("ai_url", "http://192.168.1.100:11434/v1/chat/completions") ?: ""
+        get() = str("ai_url", "http://192.168.1.100:11434/v1/chat/completions")
         set(v) = sp.edit().putString("ai_url", v).apply()
-
     var aiModel: String
-        get() = sp.getString("ai_model", "qwen2.5:1.5b") ?: ""
+        get() = str("ai_model", "qwen2.5:1.5b")
         set(v) = sp.edit().putString("ai_model", v).apply()
-
     var background: Boolean
         get() = sp.getBoolean("background", true)
         set(v) = sp.edit().putBoolean("background", v).apply()
-
     var dailyReport: Boolean
         get() = sp.getBoolean("daily_report", false)
         set(v) = sp.edit().putBoolean("daily_report", v).apply()
-
     var logEverySec: Int
         get() = sp.getInt("log_every", 10)
         set(v) = sp.edit().putInt("log_every", v).apply()
+    /** "system", "en", "fa", "ps" */
+    var lang: String
+        get() = str("lang", "system")
+        set(v) = sp.edit().putString("lang", v).commit().let { }
+    /** "system", "light", "dark" */
+    var theme: String
+        get() = str("theme", "system")
+        set(v) = sp.edit().putString("theme", v).apply()
+    /** Last reading, for the home screen widget. */
+    var widgetJson: String
+        get() = str("widget", "")
+        set(v) = sp.edit().putString("widget", v).apply()
 
     var greenhouses: List<SavedGh>
         get() = try {
-            val a = JSONArray(sp.getString("greenhouses", "[]"))
+            val a = JSONArray(str("greenhouses", "[]"))
             List(a.length()) { i ->
                 val o = a.getJSONObject(i)
                 SavedGh(o.optString("name"), o.optString("addr"), o.optString("id"), o.optString("cloud"))
@@ -276,7 +329,7 @@ object Prefs {
     fun saveGreenhouse(g: SavedGh) {
         val list = greenhouses.toMutableList()
         val i = list.indexOfFirst {
-            (g.id.isNotEmpty() && it.id == g.id) || (g.cloud.isNotEmpty() && it.cloud == g.cloud) || it.addr.equals(g.addr, true)
+            (g.id.isNotEmpty() && it.id == g.id && it.viewOnly == g.viewOnly) || (g.cloud.isNotEmpty() && it.cloud == g.cloud) || it.addr.equals(g.addr, true)
         }
         if (i >= 0) {
             val old = list[i]

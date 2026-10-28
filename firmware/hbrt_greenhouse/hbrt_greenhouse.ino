@@ -1,7 +1,32 @@
+/* HBRT AGRO Smart Greenhouse - firmware 6.0
+   Developed by Mostafa Mesbah Aabedi & Milad Ahmadi
+   HBRT - Herat Boys Robotic Team
+
+   What the board does
+   - Reads the sensors every 2 s and runs the greenhouse (automatic, manual or away mode)
+   - Local control on Wi-Fi (WebSocket port 81) and from anywhere through Firebase
+   - Timed overrides: "fan on for 30 min, then back to automatic"
+   - Watering times (skipped when rain is forecast), soil-based watering, your own rules
+   - Weather for your location (Open-Meteo, no key), frost warning
+   - Crop, planting date, growth stage and harvest estimate (growing degree days)
+   - Water and electricity used per day, 7-day history in the cloud, nothing lost while offline
+   - Activity timeline: every change with the reason
+   - Telegram bot: alerts and commands (/status, /water 10, /fan on ...)
+   - Wi-Fi setup page (no Wi-Fi name in the code), soil/tank calibration, updates over the air
+
+   Tabs: commands, control, events, net_cloud, oled, state, telegram, wifi_portal
+
+   Board: ESP32 Dev Module.  Tools > Partition Scheme > "Minimal SPIFFS (1.9MB APP with OTA)"
+   Libraries: DHT sensor library, ESP32Servo, U8g2, OneWire, DallasTemperature,
+              ArduinoJson (7.x), WebSockets (Markus Sattler)                                    */
+
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <HTTPClient.h>
+#include <HTTPUpdate.h>
+#include <Update.h>
 #include <WebServer.h>
+#include <DNSServer.h>
 #include <WebSocketsServer.h>
 #include <ArduinoJson.h>
 #include <DHT.h>
@@ -12,41 +37,20 @@
 #include <DallasTemperature.h>
 #include <Preferences.h>
 #include <time.h>
+#include <esp_system.h>
 
-/* HBRT AGRO Smart Greenhouse - firmware 5.0
-   Developed by Mostafa Mesbah Aabedi & Milad Ahmadi
-   HBRT - Herat Boys Robotic Team
+#define FW_VERSION "6.0"
 
-   New in 5.0 - control from anywhere, no tunnel:
-   - Firebase Realtime Database cloud link (plain HTTPS, no Firebase library needed)
-     * runs on the other CPU core, so slow internet never freezes sensors, relays or the app
-     * pushes live state, receives commands, keeps a 7-day history (one point every 5 min)
-     * goes "fast" (2 s updates) only while someone is watching, saves data the rest of the time
-     * commands older than 60 s are ignored (no surprise pump runs after an outage)
-   - Every board gets its own private cloud key. Phones pair automatically the first time they
-     connect on the same Wi-Fi; after that the app and the website work from any network.
-   - Real clock from the internet (NTP): grow-light schedule keeps working after a reboot
-   - Open http://<board-ip>/ on the same Wi-Fi to get the "open from anywhere" link
+/* Wi-Fi the board tries first. Pick another one any time on the setup page
+   (hold the BOOT button 3 s, or wait 1 minute without Wi-Fi, then join "HBRT-Setup-xxxx"). */
+#define WIFI_SSID_DEFAULT "1"
+#define WIFI_PASS_DEFAULT "123456789"
 
-   Local Wi-Fi control (WebSocket on port 81) works exactly like 4.0, with or without internet.
-
-   Libraries: DHT sensor library, ESP32Servo, U8g2, OneWire, DallasTemperature, ArduinoJson,
-              WebSockets (Markus Sattler). Board: ESP32 Dev Module (ESP32 package 2.x or 3.x). */
-
-#define FW_VERSION "5.0"
-
-/* ================= WIFI ================= */
-const char* ssid     = "1";
-const char* password = "123456789";
-
-/* ================= CLOUD (Firebase Realtime Database) =================
-   Host only, no https:// and no slash. Leave "" to turn the cloud link off.            */
+/* Cloud (Firebase Realtime Database). Host only. "" turns the cloud off. */
 #define FIREBASE_HOST "airqualityproject-e49ae-default-rtdb.firebaseio.com"
-#define FIREBASE_AUTH ""        // database secret, only if your rules need one
+#define FIREBASE_AUTH ""
 #define WEB_APP "https://mostafaaabedia-tech.github.io/HBRT-AGRO/"
-
-WebServer server(80);
-WebSocketsServer webSocket = WebSocketsServer(81);
+#define OTA_URL "https://github.com/mostafaaabedia-tech/Greenhouse_Kotlin/releases/latest/download/hbrt_greenhouse.bin"
 
 /* ================= PINS ================= */
 #define DHTPIN 4
@@ -59,7 +63,85 @@ WebSocketsServer webSocket = WebSocketsServer(81);
 #define LIGHTS_RELAY 25
 #define HEATER_RELAY 26
 #define SERVO_PIN 13
+#define SETUP_PIN 0          // the BOOT button on the board
 
+/* ================= TYPES ================= */
+enum Dev  { D_FAN, D_PUMP, D_LIGHTS, D_HEATER, D_VENT, D_COUNT };
+enum Mode { M_AUTO, M_MANUAL, M_AWAY };
+enum By   { BY_AUTO, BY_USER, BY_SCHED, BY_SAFETY, BY_RULE, BY_TIMER, BY_AWAY, BY_TG, BY_SYS };
+enum Why  { RS_NONE, RS_HOT, RS_COLD, RS_HUMID, RS_DRY, RS_MOIST, RS_TANK, RS_MAXRUN, RS_LIGHTSON, RS_LIGHTSOFF,
+            RS_RULE, RS_OK, RS_SENSOR, RS_DONE, RS_RAIN, RS_FROST, RS_LOCK, RS_DHT, RS_ST, RS_AWAY, RS_MANUAL,
+            RS_STAGE, RS_COUNT };
+enum EvCode { E_DEV, E_ALERT, E_MODE, E_SKIP, E_BOOT, E_CFG, E_CAL, E_OTA, E_WIFI, E_WATER, E_OVREND, E_STAGE };
+enum Alert  { A_HOT, A_COLD, A_HUMID, A_DRY, A_TANK, A_LOCK, A_DHT, A_ST, A_FROST, A_COUNT };
+
+const char* DEV_NAME[]  = {"fan", "pump", "lights", "heater", "servo"};
+const char* MODE_NAME[] = {"auto", "manual", "away"};
+const char* BY_NAME[]   = {"auto", "you", "schedule", "safety", "rule", "timer", "away", "telegram", "system"};
+const char* WHY_NAME[]  = {"", "hot", "cold", "humid", "dry", "moist", "tank", "maxrun", "lightson", "lightsoff",
+                           "rule", "ok", "sensor", "done", "rain", "frost", "lock", "dht", "st", "away", "manual", "stage"};
+const char* EV_NAME[]   = {"dev", "alert", "mode", "skip", "boot", "cfg", "cal", "ota", "wifi", "water", "ovrend", "stage"};
+const char* ALERT_NAME[]= {"hot", "cold", "humid", "dry", "tank", "lock", "dht", "st", "frost"};
+const int   DEV_PIN[]   = {FAN_RELAY, PUMP_RELAY, LIGHTS_RELAY, HEATER_RELAY, -1};
+
+struct Slot { uint16_t min; uint16_t sec; uint8_t days; };                 // watering time
+struct Rule { uint8_t sensor; uint8_t op; float val; uint8_t dev; uint8_t on; };  // if sensor op val -> dev on/off
+struct Eff  { float tMax, tMin, hMax; int sMin; };                          // limits in force right now
+struct Crop { const char* id; float base; float gddHarvest; float tMin, tMax, hMax; int sMin; };
+
+const Crop CROPS[] = {
+  {"tomato",     10, 1250, 18, 30, 75, 40},
+  {"cucumber",   10,  850, 20, 32, 80, 50},
+  {"pepper",     10, 1300, 20, 30, 70, 40},
+  {"lettuce",     4,  900, 10, 24, 70, 45},
+  {"strawberry",  7, 1100, 15, 26, 75, 45},
+  {"herbs",      10,  700, 16, 28, 65, 35},
+};
+const int N_CROPS = 6;
+const char* STAGE_NAME[] = {"seedling", "growing", "flowering", "fruiting", "harvest"};
+
+struct Config {
+  float tempMax = 35, tempMin = 15, humMax = 60;
+  int   soilMin = 30, waterMin = 5, pumpMaxSec = 60;
+  bool  lightSched = false;
+  int   lightOn = 6 * 60, lightOff = 20 * 60;
+  // usage
+  int   flowMl = 20;                 // pump flow, millilitres per second
+  int   tankL = 20;                  // tank size in litres
+  int   watt[D_COUNT] = {20, 15, 40, 300, 0};
+  // crop
+  int   crop = -1;                   // index into CROPS, -1 = none
+  int32_t plantDay = 0;              // local day number of planting (days since 1970), 0 = not set
+  bool  autoStage = false;           // change limits as the plant grows
+  // weather
+  float lat = 34.35f, lon = 62.20f;  // Herat
+  bool  rainSkip = true, frostAlert = true;
+  // alerts
+  bool  quiet = true;
+  int   quietFrom = 22 * 60, quietTo = 7 * 60;
+  uint16_t alertMask = 0x1FF;        // one bit per Alert
+  bool  dailySummary = true;
+  uint8_t lang = 0;                  // 0 English, 1 Dari, 2 Pashto (Telegram messages)
+  // calibration (raw ADC)
+  int   soilDry = 4095, soilWet = 0, waterEmpty = 0, waterFull = 4095;
+} cfg;
+
+Slot sched[4]; uint8_t nSched = 0;
+Rule rules[6]; uint8_t nRules = 0;
+
+struct Event { uint32_t n; uint32_t t; uint8_t c, d, by, w, v; float x; };
+const int EV_N = 40;
+
+struct Wx {
+  bool ok = false; uint32_t at = 0;
+  float now = 0; int code = 0;
+  float tMax[4], tMin[4], pp[4], ps[4]; int dcode[4];
+} wx;
+
+/* ================= OBJECTS ================= */
+WebServer server(80);
+WebSocketsServer webSocket(81);
+DNSServer dns;
 DHT dht(DHTPIN, DHTTYPE);
 OneWire oneWire(DS18B20_PIN);
 DallasTemperature ds18b20(&oneWire);
@@ -67,72 +149,76 @@ Servo ventServo;
 U8G2_SH1106_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 Preferences prefs;
 
-/* ================= SETTINGS (saved in flash) ================= */
-struct Config {
-  float tempMax  = 35;
-  float tempMin  = 15;
-  float humMax   = 60;
-  int   soilMin  = 30;
-  int   waterMin = 5;
-  int   pumpMaxSec = 60;
-  bool  lightSched = false;  // grow-light schedule on/off
-  int   lightOn  = 6 * 60;   // minutes after midnight
-  int   lightOff = 20 * 60;
-} cfg;
-String ghName = "My Greenhouse";
-String chipId;
-String cloudKey;             // private path in the database
-long   tzOffset = 0;         // seconds, learned from the phone (e.g. Kabul = 16200)
-bool   tzKnown = false;
-
-const unsigned long PUMP_COOLDOWN_MS = 5UL * 60UL * 1000UL;
-
 /* ================= STATE ================= */
+String ghName = "My Greenhouse", chipId, cloudKey, viewKey, tgToken, tgChat;
+String wifiSsid, wifiPass;
+long  tzOffset = 16200;              // Kabul/Herat, corrected by the weather service or the phone
+uint8_t mode = M_AUTO;
+
 float temperature = 0, humidity = 0, soilTemp = 0;
-int soil = 0, water = 0;
-bool fanState = false, pumpState = false, lightsState = false, heaterState = false, servoState = false;
-bool autoMode = true;
-bool lastFanState = true, lastPumpState = true, lastLightsState = true, lastHeaterState = true, lastServoState = true;
+int   soil = 0, water = 0, rawSoil = 0, rawWater = 0;
+bool  dhtOk = true, soilTempOk = true, dsRequested = false, firstRead = true;
+int   dhtFails = 0;
 
-bool dhtOk = true, soilTempOk = true;
-int  dhtFails = 0;
-bool dsRequested = false;
+bool  dev[D_COUNT] = {false, false, false, false, false};
+bool  applied[D_COUNT] = {true, true, true, true, true};
+bool  ovrVal[D_COUNT];
+uint32_t ovrUntil[D_COUNT] = {0, 0, 0, 0, 0};   // millis deadline, 0 = none
+const uint32_t OVR_FOREVER = 0xFFFFFFFF;
+uint8_t climate = 0;                 // 0 idle, 1 cooling, 2 heating
+bool  autoWatering = false;
+unsigned long waterUntil = 0, pumpOnSince = 0, pumpLockUntil = 0;
+uint8_t waterBy = BY_USER;
+int32_t schedFired[4] = {0, 0, 0, 0};
 
-unsigned long lastUpdate = 0, pumpOnSince = 0, pumpLockUntil = 0, waterUntil = 0;
-unsigned long lastWifiTry = 0, wifiDownSince = 0;
+// usage, today and the last 7 days
+uint32_t onMs[D_COUNT] = {0, 0, 0, 0, 0};
+float dayL[7], dayKwh[7]; int32_t dayNum[7];
+int32_t curDay = 0;
+float dayTMax = -99, dayTMin = 99, gdd = 0;
+int lastStage = -1;
 
-// Fallback clock (set by the app) when NTP is not available yet
-bool timeKnown = false;
-uint32_t baseEpochLocal = 0;
-unsigned long baseMillis = 0;
+// events and alerts
+Event evRing[EV_N]; uint32_t evSeq = 0;
+uint16_t alertActive = 0; uint8_t alertCount[A_COUNT]; unsigned long alertLastSent[A_COUNT];
 
-/* ---- shared between the main loop (core 1) and the cloud task (core 0) ---- */
-SemaphoreHandle_t stateLock;
-String sharedState;                  // latest state JSON, written by loop, read by the cloud task
-volatile bool stateDirty = true;     // something changed, push it now
-volatile bool cloudOk = false;       // last cloud request worked
-volatile bool cloudFast = false;     // someone is watching from the cloud
-volatile int  cloudCode = 0;         // last HTTP code (shown on OLED / app when it fails)
-QueueHandle_t cmdQueue;              // commands from the cloud -> loop
-struct CmdMsg { char json[256]; };
+// health
+uint32_t wifiDrops = 0, cloudErrors = 0;
+String otaStatus = "";
 
-uint32_t utcNow() {                  // seconds since 1970 (UTC), 0 if unknown
-  time_t t = time(nullptr);
-  return t > 1600000000 ? (uint32_t)t : 0;
-}
+unsigned long lastTick = 0, lastWifiTry = 0, wifiDownSince = 0, bootMs = 0, lastUsageTick = 0;
 
-int minutesNow() {
-  uint32_t u = utcNow();
-  if (u && tzKnown) return ((u + tzOffset) % 86400UL) / 60;
-  if (!timeKnown) return -1;
-  uint32_t t = baseEpochLocal + (millis() - baseMillis) / 1000;
-  return (t % 86400UL) / 60;
-}
+/* ---- shared with the network task on core 0 ---- */
+SemaphoreHandle_t lock;
+String jsS, jsSView, jsCfg, jsWx, jsUse;          // ready-made JSON for the cloud
+volatile bool dS = true, dCfg = true, dWx = true, dUse = true;       // dirty for the control path
+volatile bool vS = true, vCfg = true, vWx = true, vUse = true;       // dirty for the view-only path
+volatile bool wxChanged = false, cloudOk = false, cloudFast = false, viewFast = false;
+volatile bool cfgPending = true, wxRefresh = false, tzSave = false, tgChatSave = false;
+volatile bool otaRequest = false, tgTestRequest = false, wifiApply = false;
+String otaUrl = OTA_URL;
+volatile int cloudCode = 0;
+volatile uint8_t tgState = 0;                      // 0 off, 1 ok, 2 error
+QueueHandle_t cmdQueue;
+struct CmdMsg { char json[300]; uint8_t by; };
+QueueHandle_t tgQueue;
+struct TgMsg { char text[400]; };
 
-/* ================= CONFIG STORAGE ================= */
-String makeKey() {
+bool portalOn = false;
+unsigned long portalSince = 0, setupPressSince = 0;
+
+/* ================= TIME ================= */
+uint32_t utcNow() { time_t t = time(nullptr); return t > 1600000000 ? (uint32_t)t : 0; }
+bool timeOk() { return utcNow() != 0; }
+int32_t localDay() { uint32_t u = utcNow(); return u ? (int32_t)((u + tzOffset) / 86400) : 0; }
+int minutesNow() { uint32_t u = utcNow(); return u ? (int)(((u + tzOffset) % 86400UL) / 60) : -1; }
+int weekday() { uint32_t u = utcNow(); return u ? (int)(((u + tzOffset) / 86400 + 4) % 7) : -1; }   // 0 = Sunday
+bool inWindow(int m, int from, int to) { return from <= to ? (m >= from && m < to) : (m >= from || m < to); }
+
+/* ================= STORAGE ================= */
+String makeKey(const char* prefix) {
   const char* abc = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789";
-  String k = "gh";
+  String k = prefix;
   for (int i = 0; i < 22; i++) k += abc[esp_random() % 56];
   return k;
 }
@@ -148,332 +234,54 @@ void loadConfig() {
   cfg.lightSched = prefs.getBool("lsch", cfg.lightSched);
   cfg.lightOn    = prefs.getInt("lon", cfg.lightOn);
   cfg.lightOff   = prefs.getInt("loff", cfg.lightOff);
-  ghName         = prefs.getString("name", ghName);
-  tzKnown        = prefs.isKey("tz");
-  tzOffset       = prefs.getLong("tz", 0);
-  cloudKey       = prefs.getString("ckey", "");
-  if (cloudKey.length() < 16) { cloudKey = makeKey(); prefs.putString("ckey", cloudKey); }
+  if (prefs.getBytesLength("cfg2") == sizeof(Config)) prefs.getBytes("cfg2", &cfg, sizeof(Config));
+  if (prefs.getBytesLength("sched") == sizeof(sched)) { prefs.getBytes("sched", sched, sizeof(sched)); nSched = prefs.getUChar("nsch", 0); }
+  if (prefs.getBytesLength("rules") == sizeof(rules)) { prefs.getBytes("rules", rules, sizeof(rules)); nRules = prefs.getUChar("nrul", 0); }
+  if (prefs.getBytesLength("days") == sizeof(dayL)) {
+    prefs.getBytes("days", dayL, sizeof(dayL)); prefs.getBytes("dkwh", dayKwh, sizeof(dayKwh)); prefs.getBytes("dnum", dayNum, sizeof(dayNum));
+  } else { for (int i = 0; i < 7; i++) { dayL[i] = 0; dayKwh[i] = 0; dayNum[i] = 0; } }
+  gdd      = prefs.getFloat("gdd", 0);
+  curDay   = prefs.getInt("curday", 0);
+  mode     = prefs.getUChar("mode", M_AUTO); if (mode > M_AWAY) mode = M_AUTO;
+  ghName   = prefs.getString("name", ghName);
+  tzOffset = prefs.getLong("tz", tzOffset);
+  cloudKey = prefs.getString("ckey", "");
+  viewKey  = prefs.getString("vkey", "");
+  tgToken  = prefs.getString("tgtok", "");
+  tgChat   = prefs.getString("tgchat", "");
+  wifiSsid = prefs.getString("wssid", WIFI_SSID_DEFAULT);
+  wifiPass = prefs.getString("wpass", WIFI_PASS_DEFAULT);
+  if (cloudKey.length() < 16) { cloudKey = makeKey("gh"); prefs.putString("ckey", cloudKey); }
   prefs.end();
 }
+
 void saveConfig() {
   prefs.begin("hbrt", false);
-  prefs.putFloat("tmax", cfg.tempMax);
-  prefs.putFloat("tmin", cfg.tempMin);
-  prefs.putFloat("hmax", cfg.humMax);
-  prefs.putInt("smin", cfg.soilMin);
-  prefs.putInt("wmin", cfg.waterMin);
-  prefs.putInt("pmax", cfg.pumpMaxSec);
-  prefs.putBool("lsch", cfg.lightSched);
-  prefs.putInt("lon", cfg.lightOn);
-  prefs.putInt("loff", cfg.lightOff);
+  prefs.putFloat("tmax", cfg.tempMax);  prefs.putFloat("tmin", cfg.tempMin);  prefs.putFloat("hmax", cfg.humMax);
+  prefs.putInt("smin", cfg.soilMin);    prefs.putInt("wmin", cfg.waterMin);   prefs.putInt("pmax", cfg.pumpMaxSec);
+  prefs.putBool("lsch", cfg.lightSched); prefs.putInt("lon", cfg.lightOn);    prefs.putInt("loff", cfg.lightOff);
+  prefs.putBytes("cfg2", &cfg, sizeof(Config));
+  prefs.putBytes("sched", sched, sizeof(sched)); prefs.putUChar("nsch", nSched);
+  prefs.putBytes("rules", rules, sizeof(rules)); prefs.putUChar("nrul", nRules);
   prefs.putString("name", ghName);
+  prefs.putUChar("mode", mode);
+  prefs.end();
+  cfgPending = true;
+}
+
+void saveString(const char* k, const String& v) { prefs.begin("hbrt", false); prefs.putString(k, v); prefs.end(); }
+
+void saveDays() {
+  prefs.begin("hbrt", false);
+  prefs.putBytes("days", dayL, sizeof(dayL)); prefs.putBytes("dkwh", dayKwh, sizeof(dayKwh)); prefs.putBytes("dnum", dayNum, sizeof(dayNum));
+  prefs.putFloat("gdd", gdd); prefs.putInt("curday", curDay);
   prefs.end();
 }
 
 bool pumpLocked() { return pumpLockUntil && (long)(pumpLockUntil - millis()) > 0; }
 bool cloudOn() { return strlen(FIREBASE_HOST) > 0; }
 String shareLink() { return String(WEB_APP) + "#g=" + cloudKey + "@" + FIREBASE_HOST; }
-
-/* ================= STATE OUT (WebSocket + cloud) ================= */
-void buildState(String& json) {
-  StaticJsonDocument<1536> doc;
-  doc["name"] = ghName;
-  doc["id"] = chipId;
-  doc["fw"] = FW_VERSION;
-  doc["temperature"] = temperature;
-  doc["humidity"] = humidity;
-  doc["soil"] = soil;
-  doc["water"] = water;
-  doc["soilTemp"] = soilTemp;
-  doc["fan"] = fanState;
-  doc["pump"] = pumpState;
-  doc["lights"] = lightsState;
-  doc["heater"] = heaterState;
-  doc["servo"] = servoState;
-  doc["auto"] = autoMode;
-  doc["rssi"] = WiFi.RSSI();
-  doc["uptime"] = millis() / 1000;
-  doc["pumpLock"] = pumpLocked();
-  doc["dhtOk"] = dhtOk;
-  doc["stOk"] = soilTempOk;
-  doc["timeOk"] = minutesNow() >= 0;
-  doc["watering"] = waterUntil ? (long)(waterUntil - millis()) / 1000 + 1 : 0;
-  doc["ip"] = WiFi.localIP().toString();
-  if (cloudOn()) {
-    doc["db"] = FIREBASE_HOST;
-    doc["key"] = cloudKey;
-    doc["cloud"] = (bool)cloudOk;
-  }
-  JsonObject c = doc.createNestedObject("cfg");
-  c["tempMax"] = cfg.tempMax;
-  c["tempMin"] = cfg.tempMin;
-  c["humMax"] = cfg.humMax;
-  c["soilMin"] = cfg.soilMin;
-  c["waterMin"] = cfg.waterMin;
-  c["pumpMax"] = cfg.pumpMaxSec;
-  c["lightSched"] = cfg.lightSched;
-  c["lightOn"] = cfg.lightOn;
-  c["lightOff"] = cfg.lightOff;
-  serializeJson(doc, json);
-}
-
-void sendData() {
-  String json;
-  buildState(json);
-  if (webSocket.connectedClients() > 0) webSocket.broadcastTXT(json);
-  xSemaphoreTake(stateLock, portMAX_DELAY);
-  sharedState = json;
-  xSemaphoreGive(stateLock);
-}
-
-/* ================= OUTPUTS ================= */
-void applyOutputs() {
-  if (fanState != lastFanState)       { digitalWrite(FAN_RELAY, fanState ? LOW : HIGH);       lastFanState = fanState; }
-  if (pumpState != lastPumpState)     { digitalWrite(PUMP_RELAY, pumpState ? LOW : HIGH);     lastPumpState = pumpState; }
-  if (lightsState != lastLightsState) { digitalWrite(LIGHTS_RELAY, lightsState ? LOW : HIGH); lastLightsState = lightsState; }
-  if (heaterState != lastHeaterState) { digitalWrite(HEATER_RELAY, heaterState ? LOW : HIGH); lastHeaterState = heaterState; }
-  if (servoState != lastServoState)   { ventServo.write(servoState ? 180 : 0);                lastServoState = servoState; }
-}
-
-/* ================= SAFETY (always active) ================= */
-void safety() {
-  if (pumpState) {
-    if (!pumpOnSince) pumpOnSince = millis();
-    if (water <= cfg.waterMin) {
-      pumpState = false; pumpOnSince = 0; waterUntil = 0;
-    } else if (millis() - pumpOnSince > (unsigned long)cfg.pumpMaxSec * 1000UL) {
-      pumpState = false; pumpOnSince = 0; waterUntil = 0;
-      pumpLockUntil = millis() + PUMP_COOLDOWN_MS;
-    }
-  } else {
-    pumpOnSince = 0;
-  }
-  if (pumpLocked()) { pumpState = false; waterUntil = 0; }
-}
-
-/* ================= TIMED WATERING ================= */
-void timedWatering() {
-  if (!waterUntil) return;
-  if ((long)(waterUntil - millis()) > 0) pumpState = true;
-  else { pumpState = false; waterUntil = 0; }
-}
-
-/* ================= COMMANDS (same JSON from the app, the website and the cloud) ================= */
-// wsNum >= 0: came over the local WebSocket.  wsNum = -1: came from the cloud.
-void applyCommand(JsonDocument& doc, int wsNum) {
-  if (doc["ping"]) { if (wsNum >= 0) webSocket.sendTXT(wsNum, "{\"pong\":1}"); return; }
-
-  String device = doc["device"] | "";
-
-  if (device == "config") {
-    cfg.tempMax    = doc["tempMax"]  | cfg.tempMax;
-    cfg.tempMin    = doc["tempMin"]  | cfg.tempMin;
-    cfg.humMax     = doc["humMax"]   | cfg.humMax;
-    cfg.soilMin    = constrain((int)(doc["soilMin"]  | cfg.soilMin), 0, 100);
-    cfg.waterMin   = constrain((int)(doc["waterMin"] | cfg.waterMin), 0, 100);
-    cfg.pumpMaxSec = constrain((int)(doc["pumpMax"]  | cfg.pumpMaxSec), 5, 600);
-    cfg.lightSched = doc["lightSched"] | cfg.lightSched;
-    cfg.lightOn    = constrain((int)(doc["lightOn"]  | cfg.lightOn), 0, 1439);
-    cfg.lightOff   = constrain((int)(doc["lightOff"] | cfg.lightOff), 0, 1439);
-    saveConfig();
-  }
-  else if (device == "name") {
-    String n = doc["value"] | "";
-    n.trim();
-    if (n.length() > 0 && n.length() <= 32) { ghName = n; saveConfig(); }
-  }
-  else if (device == "time") {               // phone sends its local time in seconds
-    uint32_t local = doc["value"] | 0UL;
-    if (local > 1600000000UL) {
-      baseEpochLocal = local; baseMillis = millis(); timeKnown = true;
-      uint32_t u = utcNow();
-      if (u) {                                // learn the time zone (rounded to 15 min)
-        long off = lround(((double)local - (double)u) / 900.0) * 900L;
-        if (!tzKnown || off != tzOffset) {
-          tzOffset = off; tzKnown = true;
-          prefs.begin("hbrt", false); prefs.putLong("tz", tzOffset); prefs.end();
-        }
-      }
-    }
-    return;
-  }
-  else if (device == "water") {               // water now for N seconds
-    int sec = constrain((int)(doc["value"] | 10), 1, cfg.pumpMaxSec);
-    if (water > cfg.waterMin && !pumpLocked()) {
-      waterUntil = millis() + (unsigned long)sec * 1000UL;
-      pumpState = true;
-    }
-  }
-  else if (device == "rekey" && wsNum >= 0) { // new private cloud key (old links stop working)
-    String k = makeKey();
-    xSemaphoreTake(stateLock, portMAX_DELAY);
-    cloudKey = k;
-    xSemaphoreGive(stateLock);
-    prefs.begin("hbrt", false); prefs.putString("ckey", k); prefs.end();
-  }
-  else if (device == "alloff") {
-    fanState = pumpState = lightsState = heaterState = servoState = false;
-    waterUntil = 0; autoMode = false;
-  }
-  else {
-    bool value = doc["value"] | false;
-    if (device == "fan")         { fanState = value;    autoMode = false; }
-    else if (device == "pump")   {
-      if (value && (water <= cfg.waterMin || pumpLocked())) { sendData(); return; }
-      pumpState = value; autoMode = false;
-      if (!value) waterUntil = 0;
-    }
-    else if (device == "lights") { lightsState = value; autoMode = false; }
-    else if (device == "heater") { heaterState = value; autoMode = false; }
-    else if (device == "servo")  { servoState = value;  autoMode = false; }
-    else if (device == "auto")   { autoMode = value; }
-    else return;
-  }
-
-  safety();
-  applyOutputs();
-  sendData();
-  stateDirty = true;                          // show the result in the cloud right away
-}
-
-void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
-  switch (type) {
-    case WStype_CONNECTED: sendData(); break;
-    case WStype_TEXT: {
-      StaticJsonDocument<512> doc;
-      if (!deserializeJson(doc, payload, length)) applyCommand(doc, num);
-      break;
-    }
-    default: break;
-  }
-}
-
-/* ================= CLOUD TASK (core 0) =================
-   Database layout (everything under one private key):
-     /hbrt/<key>/state       live state, same JSON as the WebSocket + "t" (server time)
-     /hbrt/<key>/in/cmd      commands pushed by the app / website, deleted once done
-     /hbrt/<key>/in/seen     server time when an app last looked (makes the board go fast)
-     /hbrt/<key>/log/<slot>  history ring buffer, 5-min points, 7 days                    */
-WiFiClientSecure tls;
-HTTPClient http;
-
-String fbKey;                      // the cloud task's own copy of cloudKey
-
-String fbUrl(const String& path) {
-  String u = String("https://") + FIREBASE_HOST + "/hbrt/" + fbKey + path + ".json";
-  if (strlen(FIREBASE_AUTH) > 0) u += String("?auth=") + FIREBASE_AUTH;
-  return u;
-}
-
-int fbRequest(const char* method, const String& path, const String& body, String* reply = nullptr) {
-  if (!http.begin(tls, fbUrl(path))) return -1;
-  http.addHeader("Content-Type", "application/json");
-  int code;
-  if (strcmp(method, "GET") == 0) code = http.GET();
-  else code = http.sendRequest(method, body);
-  if (reply && code == 200) *reply = http.getString();
-  else if (code > 0) http.getString();              // drain so the connection can be reused
-  http.end();
-  return code;
-}
-
-void cloudTask(void*) {
-  tls.setInsecure();               // skip the certificate check (fine for a school project)
-  tls.setHandshakeTimeout(12);
-  http.setReuse(true);             // one connection kept open = fast requests
-  http.setTimeout(5000);
-
-  unsigned long lastPush = 0, lastPoll = 0, lastLog = 0;
-  uint32_t lastSlot = 0xFFFFFFFF;
-  int fails = 0;
-
-  for (;;) {
-    if (WiFi.status() != WL_CONNECTED) { cloudOk = false; vTaskDelay(pdMS_TO_TICKS(1000)); continue; }
-    unsigned long now = millis();
-    bool fast = cloudFast;
-    xSemaphoreTake(stateLock, portMAX_DELAY);
-    fbKey = cloudKey;
-    xSemaphoreGive(stateLock);
-
-    // 1) live state: every 2 s while watched, every 20 s otherwise, immediately after a change
-    if (stateDirty || now - lastPush > (fast ? 2000UL : 20000UL) || lastPush == 0) {
-      stateDirty = false;
-      xSemaphoreTake(stateLock, portMAX_DELAY);
-      String s = sharedState;
-      xSemaphoreGive(stateLock);
-      if (s.length() > 2) {
-        String body = "{\"t\":{\".sv\":\"timestamp\"}," + s.substring(1);
-        int code = fbRequest("PUT", "/state", body);
-        cloudCode = code;
-        cloudOk = code == 200;
-        lastPush = millis();
-        if (code != 200) Serial.printf("[cloud] state failed: %d %s\n", code, http.errorToString(code).c_str());
-      }
-    }
-
-    // 2) commands + "is anyone watching?": every 0.6 s while watched, every 3 s otherwise
-    if (millis() - lastPoll > (fast ? 600UL : 3000UL)) {
-      lastPoll = millis();
-      String reply;
-      int code = fbRequest("GET", "/in", "", &reply);
-      if (code == 200) {
-        cloudOk = true;
-        StaticJsonDocument<3072> in;
-        if (reply != "null" && !deserializeJson(in, reply)) {
-          double seen = in["seen"] | 0.0;
-          uint32_t u = utcNow();
-          cloudFast = seen > 0 && (!u || ((double)u * 1000.0 - seen) < 60000.0);
-          JsonObject cmds = in["cmd"].as<JsonObject>();
-          if (!cmds.isNull() && cmds.size() > 0) {
-            String del = "{";
-            for (JsonPair kv : cmds) {
-              JsonObject c = kv.value().as<JsonObject>();
-              double t = c["t"] | 0.0;
-              bool fresh = !u || t == 0 || ((double)u * 1000.0 - t) < 60000.0;
-              if (fresh) {
-                CmdMsg m;
-                c.remove("t");
-                serializeJson(c, m.json, sizeof(m.json));
-                xQueueSend(cmdQueue, &m, 0);
-              }
-              if (del.length() > 1) del += ",";
-              del += "\"" + String(kv.key().c_str()) + "\":null";
-            }
-            del += "}";
-            fbRequest("PATCH", "/in/cmd", del);        // delete exactly the ones we handled
-          }
-        } else cloudFast = false;
-        fails = 0;
-      } else if (code != 0) {
-        cloudOk = false; cloudCode = code;
-        if (++fails >= 3) { tls.stop(); fails = 0; }  // fresh connection after repeated errors
-      }
-    }
-
-    // 3) history point every 5 minutes (7-day ring buffer, overwrites itself)
-    uint32_t u = utcNow();
-    if (u && millis() - lastLog > 60000UL) {
-      uint32_t slot = (u / 300) % 2016;
-      if (slot != lastSlot) {
-        char b[200];
-        snprintf(b, sizeof(b),
-                 "{\"t\":{\".sv\":\"timestamp\"},\"T\":%.1f,\"H\":%.0f,\"S\":%d,\"ST\":%.1f,\"W\":%d}",
-                 temperature, humidity, soil, soilTemp, water);
-        if (fbRequest("PUT", "/log/" + String(slot), b) == 200) { lastSlot = slot; lastLog = millis(); }
-      }
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(fast ? 50 : 200));
-  }
-}
-
-void drainCloudCommands() {
-  CmdMsg m;
-  while (xQueueReceive(cmdQueue, &m, 0) == pdTRUE) {
-    StaticJsonDocument<512> doc;
-    if (!deserializeJson(doc, m.json)) applyCommand(doc, -1);
-  }
-}
+String viewLink()  { return viewKey.length() ? String(WEB_APP) + "#v=" + viewKey + "@" + FIREBASE_HOST : String(""); }
 
 /* ================= SENSORS ================= */
 void readSensors() {
@@ -495,128 +303,43 @@ void readSensors() {
   long sSum = 0; for (int i = 0; i < 8; i++) { sSum += analogRead(SOIL_PIN); delay(2); }
   analogRead(WATER_PIN); delay(10);
   long wSum = 0; for (int i = 0; i < 8; i++) { wSum += analogRead(WATER_PIN); delay(2); }
+  rawSoil = sSum / 8; rawWater = wSum / 8;
 
-  soil  = constrain(map(sSum / 8, 4095, 0, 0, 100), 0, 100);
-  water = constrain(map(wSum / 8, 0, 4095, 0, 100), 0, 100);
+  soil  = cfg.soilDry == cfg.soilWet ? 0 : constrain(map(rawSoil, cfg.soilDry, cfg.soilWet, 0, 100), 0, 100);
+  water = cfg.waterEmpty == cfg.waterFull ? 0 : constrain(map(rawWater, cfg.waterEmpty, cfg.waterFull, 0, 100), 0, 100);
+
+  if (dhtOk) { if (temperature > dayTMax) dayTMax = temperature; if (temperature < dayTMin) dayTMin = temperature; }
+  firstRead = false;
 }
 
-/* ================= AUTO MODE ================= */
-void autoControl() {
-  if (!autoMode) return;
-
-  bool hot  = temperature > cfg.tempMax || humidity > cfg.humMax;
-  bool cold = temperature < cfg.tempMin;
-  bool okay = temperature < cfg.tempMax - 2 && humidity < cfg.humMax - 5 && temperature > cfg.tempMin + 2;
-
-  if (!dhtOk)    { fanState = false; servoState = false; heaterState = false; }
-  else if (hot)  { fanState = true;  servoState = true;  heaterState = false; }
-  else if (cold) { heaterState = true; fanState = false; servoState = false; }
-  else if (okay) { fanState = false; servoState = false; heaterState = false; }
-
-  if (!waterUntil) {
-    if (!pumpState && soil < cfg.soilMin && water > cfg.waterMin && !pumpLocked()) pumpState = true;
-    else if (pumpState && (soil >= cfg.soilMin + 10 || water <= cfg.waterMin)) pumpState = false;
+/* ================= OUTPUTS ================= */
+void applyOutputs() {
+  for (int d = 0; d < D_COUNT; d++) {
+    if (dev[d] == applied[d]) continue;
+    applied[d] = dev[d];
+    if (d == D_VENT) { ventServo.write(dev[d] ? 180 : 0); delay(50); }
+    else digitalWrite(DEV_PIN[d], dev[d] ? LOW : HIGH);   // relays are active LOW
   }
-
-  int m = minutesNow();
-  if (cfg.lightSched && m >= 0) {
-    lightsState = (cfg.lightOn <= cfg.lightOff) ? (m >= cfg.lightOn && m < cfg.lightOff)
-                                                : (m >= cfg.lightOn || m < cfg.lightOff);   // overnight
-  }
-}
-
-/* ================= OLED ================= */
-void updateOLED() {
-  u8g2.clearBuffer();
-  u8g2.setFont(u8g2_font_6x12_tr);
-  bool wifi = WiFi.status() == WL_CONNECTED;
-  String title = wifi ? ghName.substring(0, 16) : String("** NO WIFI **");
-  u8g2.drawStr(0, 10, title.c_str());
-  if (wifi && cloudOn()) u8g2.drawStr(104, 10, cloudOk ? (cloudFast ? "WEB*" : "WEB") : "LAN");
-  u8g2.drawLine(0, 13, 128, 13);
-  u8g2.setCursor(0, 27);  u8g2.print("T:");    u8g2.print(temperature, 1); u8g2.print("C");
-  u8g2.setCursor(64, 27); u8g2.print("H:");    u8g2.print(humidity, 0);    u8g2.print("%");
-  u8g2.setCursor(0, 41);  u8g2.print("Soil:"); u8g2.print(soil);           u8g2.print("%");
-  u8g2.setCursor(64, 41); u8g2.print("ST:");   u8g2.print(soilTemp, 1);    u8g2.print("C");
-  u8g2.setCursor(0, 55);  u8g2.print(autoMode ? "AUTO" : "MAN");
-  u8g2.setCursor(30, 55); u8g2.print("W:");    u8g2.print(water);          u8g2.print("%");
-  u8g2.setCursor(70, 55); u8g2.print("F"); u8g2.print(fanState ? "1" : "0");
-  u8g2.setCursor(86, 55); u8g2.print("P"); u8g2.print(pumpState ? "1" : "0");
-  u8g2.setCursor(102, 55); u8g2.print("L"); u8g2.print(lightsState ? "1" : "0");
-  u8g2.sendBuffer();
-}
-
-/* ================= WIFI KEEP-ALIVE ================= */
-void startWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.setSleep(false);
-  WiFi.setAutoReconnect(true);
-  WiFi.persistent(false);
-  WiFi.setHostname(("hbrt-" + chipId).c_str());
-  WiFi.begin(ssid, password);
-}
-
-void wifiWatchdog() {
-  if (WiFi.status() == WL_CONNECTED) { wifiDownSince = 0; return; }
-  if (!wifiDownSince) wifiDownSince = millis();
-  if (millis() - lastWifiTry > 10000) {
-    lastWifiTry = millis();
-    WiFi.disconnect();
-    WiFi.begin(ssid, password);
-  }
-  if (millis() - wifiDownSince > 10UL * 60UL * 1000UL) ESP.restart();
-}
-
-/* ================= HTTP ================= */
-void handleInfo() {
-  StaticJsonDocument<384> d;
-  d["app"] = "hbrt";
-  d["name"] = ghName;
-  d["id"] = chipId;
-  d["fw"] = FW_VERSION;
-  d["ws"] = 81;
-  if (cloudOn()) { d["db"] = FIREBASE_HOST; d["key"] = cloudKey; d["cloud"] = (bool)cloudOk; }
-  String s; serializeJson(d, s);
-  server.sendHeader("Access-Control-Allow-Origin", "*");
-  server.send(200, "application/json", s);
-}
-
-void handleRoot() {   // small page: name, status and the "open from anywhere" link
-  String link = shareLink();
-  String h = F("<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
-               "<title>HBRT Greenhouse</title><body style='margin:0;font-family:system-ui;background:#0b1410;color:#e8f5ec;"
-               "display:grid;place-items:center;min-height:100vh'><div style='max-width:420px;padding:28px'>"
-               "<p style='color:#39FF14;letter-spacing:.2em;font-size:12px;margin:0'>HBRT GREENHOUSE SERVER IS RUNNING</p><h1 style='margin:.3em 0'>");
-  h += ghName;
-  h += F("</h1><p style='color:#8fb39b'>Firmware " FW_VERSION " &middot; ");
-  h += String(temperature, 1) + "&deg;C &middot; soil " + String(soil) + "%</p>";
-  if (cloudOn()) {
-    h += F("<a style='display:block;text-align:center;background:#39FF14;color:#000;padding:14px;border-radius:14px;"
-           "font-weight:700;text-decoration:none' href='");
-    h += link;
-    h += F("'>Open from anywhere</a><p style='color:#8fb39b;font-size:13px'>Bookmark that page or send it to your team. "
-           "Anyone with the link can control this greenhouse, so share it carefully.</p>");
-  }
-  h += F("</div>");
-  server.send(200, "text/html", h);
 }
 
 /* ================= SETUP ================= */
 void setup() {
   Serial.begin(115200);
+  bootMs = millis();
   char id[7];
   snprintf(id, sizeof(id), "%06X", (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF));
   chipId = id;
-  loadConfig();
-  stateLock = xSemaphoreCreateMutex();
+  lock = xSemaphoreCreateMutex();
   cmdQueue = xQueueCreate(8, sizeof(CmdMsg));
+  tgQueue = xQueueCreate(6, sizeof(TgMsg));
+  loadConfig();
+
+  for (int d = 0; d < D_COUNT; d++) if (DEV_PIN[d] >= 0) { pinMode(DEV_PIN[d], OUTPUT); digitalWrite(DEV_PIN[d], HIGH); }
+  pinMode(SETUP_PIN, INPUT_PULLUP);
 
   dht.begin();
   ds18b20.begin();
   ds18b20.setWaitForConversion(false);
-
-  int relays[] = {FAN_RELAY, PUMP_RELAY, LIGHTS_RELAY, HEATER_RELAY};
-  for (int p : relays) { pinMode(p, OUTPUT); digitalWrite(p, HIGH); }   // active LOW: HIGH = off
 
   ESP32PWM::allocateTimer(0);
   ventServo.setPeriodHertz(50);
@@ -626,44 +349,48 @@ void setup() {
   Wire.begin(21, 22);
   u8g2.begin();
   u8g2.setPowerSave(0);
+  oledMessage("HBRT AGRO " FW_VERSION, "Connecting to", wifiSsid.c_str());
 
   startWiFi();
-  Serial.print("Connecting");
-  for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) { delay(500); Serial.print("."); }
-  if (WiFi.status() == WL_CONNECTED) { Serial.print("\nIP: "); Serial.println(WiFi.localIP()); }
-  else Serial.println("\nWiFi failed - will keep retrying in background");
+  for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) delay(500);
+  if (WiFi.status() == WL_CONNECTED) Serial.println("IP: " + WiFi.localIP().toString());
+  else Serial.println("No Wi-Fi yet. Retrying, setup page opens after 1 minute.");
 
   configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
-
-  server.on("/", handleRoot);
-  server.on("/info", handleInfo);
-  server.begin();
+  setupHttp();
   webSocket.begin();
   webSocket.onEvent(webSocketEvent);
   webSocket.enableHeartbeat(15000, 3000, 2);
 
-  sendData();
+  logEvent(E_BOOT, 255, BY_SYS, RS_NONE, 0, (float)esp_reset_reason());
+  readSensors();
+  publish(true);
   if (cloudOn()) {
-    xTaskCreatePinnedToCore(cloudTask, "cloud", 12288, nullptr, 1, nullptr, 0);
-    Serial.println("Cloud link: " + shareLink());
+    xTaskCreatePinnedToCore(cloudTask, "cloud", 16384, nullptr, 1, nullptr, 0);
+    Serial.println("Open from anywhere: " + shareLink());
   }
 }
 
 /* ================= LOOP ================= */
 void loop() {
-  wifiWatchdog();
+  if (portalOn) dns.processNextRequest();
   server.handleClient();
   webSocket.loop();
-  drainCloudCommands();
+  drainCommands();
+  setupButton();
+  wifiWatchdog();
+  if (wxChanged) { wxChanged = false; publishWx(); }
+  if (tzSave) { tzSave = false; prefs.begin("hbrt", false); prefs.putLong("tz", tzOffset); prefs.end(); }
+  if (tgChatSave) { tgChatSave = false; saveString("tgchat", tgChat); cfgPending = true; }
 
-  if (millis() - lastUpdate > 2000) {
-    lastUpdate = millis();
+  if (millis() - lastTick >= 2000) {
+    lastTick = millis();
     readSensors();
-    autoControl();
-    timedWatering();
-    safety();
-    applyOutputs();
+    dailyCheck();
+    tick();
+    trackUsage();
+    checkAlerts();
     updateOLED();
-    sendData();
+    publish(false);
   }
 }

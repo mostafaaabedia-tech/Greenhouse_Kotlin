@@ -6,6 +6,7 @@ import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import android.net.NetworkRequest
+import android.net.Uri
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -14,11 +15,15 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import okhttp3.Call
 import okhttp3.Callback
+import okhttp3.MediaType
 import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.WebSocket
@@ -26,6 +31,8 @@ import okhttp3.WebSocketListener
 import okhttp3.sse.EventSource
 import okhttp3.sse.EventSourceListener
 import okhttp3.sse.EventSources
+import okio.BufferedSink
+import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
 import java.net.Inet4Address
@@ -41,32 +48,30 @@ enum class Link { IDLE, CONNECTING, ONLINE, RECONNECTING, FAILED }
 /** How we are talking to the greenhouse right now. */
 enum class Via { NONE, WIFI, CLOUD }
 
-/** A greenhouse's private place in the Firebase database: https://<db>/hbrt/<key> */
+/** A greenhouse's place in the Firebase database: https://<db>/hbrt/<key>. View-only keys start with "gv". */
 data class CloudRef(val key: String, val db: String) {
     val base get() = "https://$db/hbrt/$key"
+    val ro get() = key.startsWith("gv")
     fun code() = "$key@$db"
-    fun shareLink() = "$WEB_APP#g=${code()}"
+    fun shareLink() = "$WEB_APP#${if (ro) "v" else "g"}=${code()}"
 
     companion object {
         const val WEB_APP = "https://mostafaaabedia-tech.github.io/HBRT-AGRO/"
         private val RX = Regex("([A-Za-z0-9]{16,})@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})")
-
-        /** Accepts a share link, "cloud:key@db" or just "key@db". */
         fun parse(s: String?): CloudRef? = s?.let { RX.find(it) }?.let { CloudRef(it.groupValues[1], it.groupValues[2]) }
     }
 }
 
 /**
- * One connection to the greenhouse, shared by the UI and the background service.
+ * One connection to the greenhouse, shared by the screens, the background service and the widget.
  *
- * Two ways to reach the board:
  *  - Wi-Fi: WebSocket on port 81. Fastest, works without internet.
  *  - Cloud: Firebase Realtime Database (live stream + command queue). Works from any network.
- * Wi-Fi is tried first. If the board can't be reached locally the app switches to the cloud on its
- * own, and switches back to Wi-Fi as soon as the board is reachable again.
+ * Wi-Fi is tried first; when the board can't be reached locally the app switches to the cloud on its
+ * own, and back to Wi-Fi as soon as the board answers locally again.
  *
- * Stability: pings every 5 s, stale-data watchdog, back-off reconnects, instant reconnect when a
- * network comes back, and local IPs forced over Wi-Fi when that Wi-Fi has no internet.
+ * The board sends five parts, the same over Wi-Fi and through the cloud:
+ *   s (live readings), cfg (settings), wx (weather), use (water/power), ev (timeline)
  */
 object GreenhouseClient {
     private lateinit var app: Context
@@ -76,31 +81,34 @@ object GreenhouseClient {
         .readTimeout(0, TimeUnit.MILLISECONDS)
         .pingInterval(5, TimeUnit.SECONDS)
         .build()
-    private val cloudHttp = OkHttpClient.Builder()
+    val cloudHttp: OkHttpClient = OkHttpClient.Builder()
         .connectTimeout(10, TimeUnit.SECONDS)
-        .readTimeout(75, TimeUnit.SECONDS)      // Firebase sends keep-alive every 30 s
-        .writeTimeout(10, TimeUnit.SECONDS)
+        .readTimeout(75, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
         .retryOnConnectionFailure(true)
         .build()
-    private val JSON = "application/json".toMediaType()
+    val JSON_TYPE = "application/json".toMediaType()
 
     val link = MutableStateFlow(Link.IDLE)
     val linked = MutableStateFlow(false)
     val via = MutableStateFlow(Via.NONE)
+    val readOnly = MutableStateFlow(false)
     /** In cloud mode: is the board itself still sending? (false = greenhouse offline) */
     val boardOnline = MutableStateFlow(true)
     val latest = MutableStateFlow<Reading?>(null)
+    val cfg = MutableStateFlow<Cfg?>(null)
+    val wx = MutableStateFlow<Wx?>(null)
+    val use = MutableStateFlow<Use?>(null)
+    val events = MutableStateFlow<List<Ev>>(emptyList())
     val live = MutableStateFlow<List<Reading>>(emptyList())
     val error = MutableStateFlow("")
     val attempt = MutableStateFlow(0)
-    val activeAlerts = MutableStateFlow<Map<String, String>>(emptyMap())
+    val activeAlerts = MutableStateFlow<List<String>>(emptyList())
 
-    /** When the board produced the newest reading (phone clock). */
     @Volatile var lastMsgAt = 0L
         private set
     @Volatile var url = ""
         private set
-    /** The address the user typed or picked (IP, URL, or "cloud:key@db"). */
     @Volatile var address = ""
         private set
     @Volatile var cloud: CloudRef? = null
@@ -113,58 +121,48 @@ object GreenhouseClient {
     @Volatile private var keepTrying = false
     @Volatile private var mode = Via.WIFI
     @Volatile private var triedCloud = false
-    @Volatile private var serverSkew = 0L          // Firebase server time minus phone time
+    @Volatile var serverSkew = 0L
+        private set
     @Volatile private var lastStateT = 0L
     @Volatile private var lastProbe = 0L
     private var ws: WebSocket? = null
     private var es: EventSource? = null
-    private var cloudState = JSONObject()
+    private var doc = JSONObject()
     private var retryJob: Job? = null
     private var beatJob: Job? = null
     private var lastLogged = 0L
     @Volatile private var namedAs = ""
     private var lastPrune = 0L
+    private var lastWidget = 0L
     private val historySynced = HashSet<String>()
 
     fun init(c: Context) {
         app = c.applicationContext
-
         scope.launch {
             while (isActive) {
                 delay(3000)
                 val now = System.currentTimeMillis()
-                if (link.value == Link.ONLINE && via.value == Via.WIFI && now - lastMsgAt > 8000) {
-                    ws?.cancel() // triggers onFailure -> reconnect
-                }
+                if (link.value == Link.ONLINE && via.value == Via.WIFI && now - lastMsgAt > 8000) ws?.cancel()
                 if (link.value == Link.ONLINE && via.value == Via.CLOUD) {
                     boardOnline.value = lastMsgAt > 0 && now - lastMsgAt < 35_000
                     if (now - lastProbe > 20_000) { lastProbe = now; tryUpgradeToWifi() }
                 }
             }
         }
-
         val cm = app.getSystemService(ConnectivityManager::class.java)
         val wifiReq = NetworkRequest.Builder().addTransportType(NetworkCapabilities.TRANSPORT_WIFI).build()
         cm.registerNetworkCallback(wifiReq, object : ConnectivityManager.NetworkCallback() {
-            override fun onAvailable(network: Network) {
-                wifi = network
-                kick()
-            }
-
-            override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) {
-                if (wifi == network) wifiProps = lp
-            }
-
-            override fun onLost(network: Network) {
-                if (wifi == network) { wifi = null; wifiProps = null }
-            }
+            override fun onAvailable(network: Network) { wifi = network; kick() }
+            override fun onLinkPropertiesChanged(network: Network, lp: LinkProperties) { if (wifi == network) wifiProps = lp }
+            override fun onLost(network: Network) { if (wifi == network) { wifi = null; wifiProps = null } }
         })
         cm.registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) = kick()
         })
     }
 
-    /** True when [host] is an IPv4 address inside the Wi-Fi network's subnet. */
+    /* ---------------- addresses ---------------- */
+
     private fun onWifiSubnet(host: String): Boolean {
         val lp = wifiProps ?: return false
         if (!Regex("^\\d+\\.\\d+\\.\\d+\\.\\d+$").matches(host)) return false
@@ -178,10 +176,7 @@ object GreenhouseClient {
         }
     }
 
-    /**
-     * HTTP client for [host]. Addresses on the Wi-Fi subnet are forced over Wi-Fi, so the app still
-     * reaches the ESP32 when that Wi-Fi has no internet. Hotspot addresses use the normal route.
-     */
+    /** Addresses on the Wi-Fi subnet go over Wi-Fi even when that Wi-Fi has no internet. */
     fun httpFor(host: String): OkHttpClient {
         val w = wifi
         return if (w != null && onWifiSubnet(host)) http.newBuilder().socketFactory(w.socketFactory).build() else http
@@ -200,32 +195,31 @@ object GreenhouseClient {
         }
     }
 
-    fun isCloudAddress(a: String) = a.startsWith("cloud:") || a.contains("#g=") || (CloudRef.parse(a) != null && !a.contains("://"))
+    fun isCloudAddress(a: String) = a.startsWith("cloud:") || a.contains("#g=") || a.contains("#v=") || (CloudRef.parse(a) != null && !a.contains("://"))
+
+    /** The board's IP on the local network, when we know it. */
+    fun localHost(): String? = try { URI(url).host } catch (e: Exception) { null } ?: latest.value?.ip?.takeIf { it.isNotBlank() && it != "0.0.0.0" }
+
+    /* ---------------- connecting ---------------- */
 
     /**
-     * @param input IP / URL for Wi-Fi, or a share link / "cloud:key@db" for cloud only.
+     * @param input IP / URL for Wi-Fi, or a share link / "cloud:key@db" for the cloud.
      * @param persistent keep retrying even if the first attempt fails (background service).
      */
     fun connect(input: String, persistent: Boolean = false) {
         val a = input.trim()
-        val cloudOnly = isCloudAddress(a)
-        if (cloudOnly) {
+        if (isCloudAddress(a)) {
             val ref = CloudRef.parse(a)
-            if (ref == null) { error.value = "That share link is not valid."; link.value = Link.FAILED; return }
-            cloud = ref
-            url = ""
-            address = "cloud:${ref.code()}"
+            if (ref == null) { error.value = app.getString(R.string.a_bad_link); link.value = Link.FAILED; return }
+            cloud = ref; url = ""; address = "cloud:${ref.code()}"
         } else {
-            url = try {
-                buildUrl(a)
-            } catch (e: Exception) {
-                error.value = "That address is not valid."
-                link.value = Link.FAILED
-                return
+            url = try { buildUrl(a) } catch (e: Exception) {
+                error.value = app.getString(R.string.a_bad_addr); link.value = Link.FAILED; return
             }
             address = a
             cloud = CloudRef.parse(Prefs.greenhouses.firstOrNull { it.addr.equals(a, true) }?.cloud)
         }
+        readOnly.value = cloud?.ro == true && url.isEmpty()
         Prefs.lastAddress = address
         manual = false
         keepTrying = persistent
@@ -234,6 +228,8 @@ object GreenhouseClient {
         error.value = ""
         triedCloud = false
         lastStateT = 0L
+        doc = JSONObject()
+        latest.value = null; cfg.value = null; wx.value = null; use.value = null; events.value = emptyList(); live.value = emptyList()
         mode = if (url.isNotEmpty()) Via.WIFI else Via.CLOUD
         open()
     }
@@ -262,137 +258,139 @@ object GreenhouseClient {
         link.value = Link.ONLINE
     }
 
-    /* ---------------- Wi-Fi (WebSocket) ---------------- */
-
     private fun openWifi(my: Int) {
-        val req = try {
-            Request.Builder().url(url).build()
-        } catch (e: Exception) {
-            error.value = "That address is not valid."
-            link.value = Link.FAILED
-            return
+        val req = try { Request.Builder().url(url).build() } catch (e: Exception) {
+            error.value = app.getString(R.string.a_bad_addr); link.value = Link.FAILED; return
         }
         ws = httpFor(req.url.host).newWebSocket(req, object : WebSocketListener() {
             override fun onOpen(webSocket: WebSocket, response: Response) {
                 if (my != gen) return
                 lastMsgAt = System.currentTimeMillis()
                 boardOnline.value = true
+                readOnly.value = false
                 online(Via.WIFI)
                 syncClock()
             }
-
             override fun onMessage(webSocket: WebSocket, text: String) {
-                if (my == gen) handle(text, System.currentTimeMillis())
+                if (my != gen) return
+                val j = try { JSONObject(text) } catch (e: Exception) { return }
+                if (j.has("pong")) return
+                if (j.has("temperature")) {                               // firmware 4.x / 5.x: one flat packet
+                    applyPart("put", listOf("s"), j)
+                    j.optJSONObject("cfg")?.let { applyPart("put", listOf("cfg"), it) }
+                } else for (k in j.keys()) applyPart(if (k == "ev") "patch" else "put", listOf(k), j.get(k))
+                afterUpdate(System.currentTimeMillis())
             }
-
-            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
-                webSocket.close(1000, null)
-            }
-
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
-                if (my == gen) lost()
-            }
-
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
-                if (my == gen) lost()
-            }
+            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(1000, null) }
+            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) { if (my == gen) lost() }
+            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) { if (my == gen) lost() }
         })
     }
-
-    /* ---------------- Cloud (Firebase) ---------------- */
 
     private fun openCloud(my: Int) {
         val ref = cloud ?: run { lost(); return }
         triedCloud = true
-        cloudState = JSONObject()
-        val req = Request.Builder().url("${ref.base}/state.json").header("Accept", "text/event-stream").build()
+        doc = JSONObject()
+        readOnly.value = ref.ro
+        val req = Request.Builder().url("${ref.base}/live.json").header("Accept", "text/event-stream").build()
         es = EventSources.createFactory(cloudHttp).newEventSource(req, object : EventSourceListener() {
             override fun onOpen(eventSource: EventSource, response: Response) {
                 if (my != gen) return
                 online(Via.CLOUD)
                 beatJob = scope.launch {
-                    syncClock()
+                    if (!ref.ro) syncClock()
                     while (isActive) { heartbeat(ref); delay(20_000) }
                 }
                 if (historySynced.add(ref.key)) scope.launch { importCloudHistory(ref) }
             }
-
             override fun onEvent(eventSource: EventSource, id: String?, type: String?, data: String) {
                 if (my != gen) return
                 when (type) {
                     "put", "patch" -> try {
                         val j = JSONObject(data)
-                        applyCloud(type, j.optString("path", "/"), j.opt("data"))
-                    } catch (e: Exception) { /* ignore malformed event */ }
+                        val parts = j.optString("path", "/").trim('/').split('/').filter { it.isNotEmpty() }
+                        applyPart(type, parts, j.opt("data"))
+                        val t = (doc.optJSONObject("s")?.optLong("t", 0L) ?: 0L)
+                        val produced = if (t > 0) t - serverSkew else 0L
+                        if (t == 0L || t != lastStateT) {
+                            if (t != 0L) lastStateT = t
+                            afterUpdate(if (produced > 0) produced.coerceAtMost(System.currentTimeMillis()) else 0L)
+                        } else afterUpdate(-1L)
+                    } catch (e: Exception) { /* ignore a malformed event */ }
                     "cancel", "auth_revoked" -> {
-                        error.value = "The cloud refused access. Check the Firebase database rules."
-                        eventSource.cancel()
-                        lost()
+                        error.value = app.getString(R.string.a_cloud_refused)
+                        eventSource.cancel(); lost()
                     }
                 }
             }
-
-            override fun onClosed(eventSource: EventSource) {
-                if (my == gen) lost()
-            }
-
+            override fun onClosed(eventSource: EventSource) { if (my == gen) lost() }
             override fun onFailure(eventSource: EventSource, t: Throwable?, response: Response?) {
-                if (my == gen) {
-                    if (response?.code == 401 || response?.code == 403) error.value = "The cloud refused access. Check the Firebase database rules."
-                    lost()
-                }
+                if (my != gen) return
+                if (response?.code == 401 || response?.code == 403) error.value = app.getString(R.string.a_cloud_refused)
+                lost()
             }
         })
     }
 
-    /** Applies a Firebase stream event to our copy of /state, then hands new readings to [handle]. */
-    private fun applyCloud(type: String, path: String, data: Any?) {
-        val parts = path.trim('/').split('/').filter { it.isNotEmpty() }
+    /** Merges one update into our copy of /live (Firebase stream path rules). */
+    @Synchronized
+    private fun applyPart(type: String, parts: List<String>, data: Any?) {
         if (parts.isEmpty()) {
-            if (type == "put") cloudState = (data as? JSONObject) ?: JSONObject()
-            else (data as? JSONObject)?.let { d -> d.keys().forEach { k -> cloudState.put(k, d.get(k)) } }
-        } else {
-            var node = cloudState
-            parts.dropLast(1).forEach { p -> node = node.optJSONObject(p) ?: JSONObject().also { node.put(p, it) } }
-            val leaf = parts.last()
-            if (data == null || data == JSONObject.NULL) node.remove(leaf)
-            else if (type == "patch" && data is JSONObject) {
-                val target = node.optJSONObject(leaf) ?: JSONObject().also { node.put(leaf, it) }
-                data.keys().forEach { k -> target.put(k, data.get(k)) }
-            } else node.put(leaf, data)
+            if (type == "put") doc = (data as? JSONObject) ?: JSONObject()
+            else (data as? JSONObject)?.let { d -> d.keys().forEach { k -> doc.put(k, d.get(k)) } }
+            return
         }
-        val t = cloudState.optLong("t", 0L)
-        if (t == 0L || t == lastStateT) return
-        lastStateT = t
-        val producedAt = t - serverSkew                 // board time -> phone clock
-        handle(cloudState.toString(), producedAt.coerceAtMost(System.currentTimeMillis()))
-        boardOnline.value = System.currentTimeMillis() - producedAt < 35_000
+        var node = doc
+        parts.dropLast(1).forEach { p -> node = node.optJSONObject(p) ?: JSONObject().also { node.put(p, it) } }
+        val leaf = parts.last()
+        if (data == null || data == JSONObject.NULL) node.remove(leaf)
+        else if (type == "patch" && data is JSONObject) {
+            val target = node.optJSONObject(leaf) ?: JSONObject().also { node.put(leaf, it) }
+            data.keys().forEach { k -> target.put(k, data.get(k)) }
+        } else node.put(leaf, data)
+    }
+
+    /** @param producedAt when the board made the newest reading (phone clock); 0 unknown, -1 = readings unchanged. */
+    private fun afterUpdate(producedAt: Long) {
+        val d = synchronized(this) { JSONObject(doc.toString()) }
+        Cfg.parse(d.optJSONObject("cfg"))?.let { if (it != cfg.value) cfg.value = it }
+        Wx.parse(d.optJSONObject("wx"))?.let { if (it != wx.value) wx.value = it }
+        Use.parse(d.optJSONObject("use"))?.let { if (it != use.value) use.value = it }
+        d.optJSONObject("ev")?.let { e ->
+            val list = e.keys().asSequence().mapNotNull { k -> e.optJSONObject(k)?.let { Ev.parse(it) } }.sortedByDescending { it.n }.toList()
+            if (list != events.value) { events.value = list; History.addEvents(latest.value?.id ?: "", list) }
+        }
+        if (producedAt == -1L) return
+        val s = d.optJSONObject("s") ?: return
+        val r = Reading.parse(s, if (producedAt > 0) producedAt else System.currentTimeMillis()) ?: return
+        if (cfg.value == null && r.legacyCfg != null) cfg.value = r.legacyCfg
+        handle(r)
+        if (via.value == Via.CLOUD) boardOnline.value = System.currentTimeMillis() - r.ts < 35_000
     }
 
     /** Tells the board someone is watching (it switches to 2-second updates) and measures clock skew. */
     private fun heartbeat(ref: CloudRef) {
         val sent = System.currentTimeMillis()
-        val req = Request.Builder().url("${ref.base}/in/seen.json")
-            .put("{\".sv\":\"timestamp\"}".toRequestBody(JSON)).build()
+        val req = Request.Builder().url("${ref.base}${if (ref.ro) "/seen" else "/in/seen"}.json")
+            .put("{\".sv\":\"timestamp\"}".toRequestBody(JSON_TYPE)).build()
         try {
             cloudHttp.newCall(req).execute().use { r ->
                 val server = r.body?.string()?.trim()?.toLongOrNull()
-                if (r.isSuccessful && server != null) {
-                    val got = System.currentTimeMillis()
-                    serverSkew = server - (sent + got) / 2
-                }
+                if (r.isSuccessful && server != null) serverSkew = server - (sent + System.currentTimeMillis()) / 2
             }
         } catch (e: IOException) { /* next beat */ }
     }
 
-    private fun cloudSend(json: String): Boolean {
+    private fun cloudSend(json: JSONObject): Boolean {
         val ref = cloud ?: return false
-        val body = try { JSONObject(json).put("t", JSONObject().put(".sv", "timestamp")).toString() } catch (e: Exception) { return false }
-        val req = Request.Builder().url("${ref.base}/in/cmd.json").post(body.toRequestBody(JSON)).build()
+        if (ref.ro) return false
+        val body = json.put("t", JSONObject().put(".sv", "timestamp")).toString()
+        val req = Request.Builder().url("${ref.base}/in/cmd.json").post(body.toRequestBody(JSON_TYPE)).build()
         cloudHttp.newCall(req).enqueue(object : Callback {
-            override fun onFailure(call: Call, e: IOException) { error.value = "Command not delivered. Check the internet." }
+            override fun onFailure(call: Call, e: IOException) { error.value = app.getString(R.string.a_not_delivered) }
             override fun onResponse(call: Call, response: Response) { response.close() }
         })
+        scope.launch { heartbeat(ref) }
         return true
     }
 
@@ -406,39 +404,28 @@ object GreenhouseClient {
             val out = ArrayList<Sample>()
             j.keys().forEach { k ->
                 val o = j.optJSONObject(k) ?: return@forEach
-                val ts = o.optLong("t") - serverSkew
-                if (ts > 0) out += Sample(
-                    ts, o.optDouble("T").toFloat(), o.optDouble("H").toFloat(), o.optInt("S"),
-                    o.optDouble("ST").toFloat(), o.optInt("W"), false, false, false, false, false
-                )
+                val ts = o.optLong("t")
+                if (ts > 0) out += Sample(ts, o.optDouble("T").toFloat(), o.optDouble("H").toFloat(), o.optInt("S"),
+                    o.optDouble("ST").toFloat(), o.optInt("W"), false, false, false, false, false)
             }
             History.fillGaps(out.sortedBy { it.ts })
         } catch (e: Exception) { /* not important */ }
     }
 
-    /** While on the cloud: if the board answers on Wi-Fi, switch to the faster local link. */
     private fun tryUpgradeToWifi() {
         val u = url
         if (u.isEmpty() || manual || wifi == null) return
         val host = try { URI(u).host } catch (e: Exception) { return } ?: return
         val client = httpFor(host).newBuilder().pingInterval(0, TimeUnit.SECONDS)
             .connectTimeout(900, TimeUnit.MILLISECONDS).callTimeout(1500, TimeUnit.MILLISECONDS).build()
-        val ok = try {
-            client.newCall(Request.Builder().url("http://$host/info").build()).execute().use { it.isSuccessful }
-        } catch (e: Exception) { false }
-        if (ok && via.value == Via.CLOUD && !manual) {
-            mode = Via.WIFI
-            open()
-        }
+        val ok = try { client.newCall(Request.Builder().url("http://$host/info").build()).execute().use { it.isSuccessful } } catch (e: Exception) { false }
+        if (ok && via.value == Via.CLOUD && !manual) { mode = Via.WIFI; open() }
     }
-
-    /* ---------------- reconnect logic ---------------- */
 
     @Synchronized
     private fun lost() {
         closeTransports()
         if (manual) return
-        // Wi-Fi failed but we know the cloud: switch right away, no waiting.
         if (mode == Via.WIFI && cloud != null && (!triedCloud || linked.value)) {
             mode = Via.CLOUD
             val my = ++gen
@@ -448,21 +435,15 @@ object GreenhouseClient {
         }
         if (!linked.value && !keepTrying) {
             link.value = Link.FAILED
-            if (error.value.isEmpty()) error.value =
-                if (cloud != null) "Could not reach the greenhouse on Wi-Fi or through the cloud. Is it powered and online?"
-                else "Could not connect. Check the IP address and that you are on the greenhouse Wi-Fi."
+            if (error.value.isEmpty()) error.value = app.getString(if (cloud != null) R.string.a_cant_any else R.string.a_cant_connect)
             return
         }
         attempt.value = attempt.value + 1
         link.value = Link.RECONNECTING
         val wait = min(1000.0 * 1.6.pow(attempt.value - 1), 10_000.0).toLong()
-        // Alternate: try Wi-Fi first each round when we have an IP, the cloud otherwise.
         mode = if (url.isNotEmpty()) Via.WIFI else Via.CLOUD
         triedCloud = false
-        retryJob = scope.launch {
-            delay(wait)
-            open()
-        }
+        retryJob = scope.launch { delay(wait); open() }
     }
 
     /** Retry right away (network came back, app returned to foreground). */
@@ -473,9 +454,7 @@ object GreenhouseClient {
             mode = if (url.isNotEmpty()) Via.WIFI else Via.CLOUD
             triedCloud = false
             open()
-        } else if (link.value == Link.ONLINE && via.value == Via.CLOUD) {
-            scope.launch { tryUpgradeToWifi() }
-        }
+        } else if (link.value == Link.ONLINE && via.value == Via.CLOUD) scope.launch { tryUpgradeToWifi() }
     }
 
     fun disconnect() {
@@ -490,109 +469,196 @@ object GreenhouseClient {
         linked.value = false
         via.value = Via.NONE
         link.value = Link.IDLE
-        latest.value = null
+        latest.value = null; cfg.value = null; wx.value = null; use.value = null; events.value = emptyList()
         live.value = emptyList()
-        activeAlerts.value = emptyMap()
+        activeAlerts.value = emptyList()
         lastMsgAt = 0L
     }
 
     /* ---------------- commands ---------------- */
 
-    /** Sends the phone's local time so the ESP32 learns the time zone for the light schedule. */
     private fun syncClock() {
         val now = System.currentTimeMillis()
-        val local = (now + TimeZone.getDefault().getOffset(now)) / 1000
-        send(JSONObject().put("device", "time").put("value", local).toString())
+        send(JSONObject().put("device", "time").put("value", (now + TimeZone.getDefault().getOffset(now)) / 1000))
     }
 
-    fun send(json: String): Boolean = when {
+    fun send(j: JSONObject): Boolean = when {
+        readOnly.value -> false
         link.value != Link.ONLINE -> false
-        via.value == Via.CLOUD -> cloudSend(json)
-        else -> ws?.send(json) == true
+        via.value == Via.CLOUD -> cloudSend(j)
+        else -> ws?.send(j.toString()) == true
     }
 
-    fun command(device: String, value: Boolean): Boolean {
-        val ok = send(JSONObject().put("device", device).put("value", value).toString())
-        if (ok && via.value == Via.CLOUD) optimistic(device, value) // instant feedback; the board confirms ~1 s later
+    private fun cmd(device: String, value: Any? = null) = JSONObject().put("device", device).also { if (value != null) it.put("value", value) }
+
+    /** Switch a device. [mins]: minutes before automatic takes over again, -1 = until changed, null = old firmware (manual mode). */
+    fun device(d: String, on: Boolean, mins: Int?): Boolean {
+        val j = cmd(d, on)
+        if (mins != null) j.put("mins", mins)
+        val ok = send(j)
+        if (ok) optimistic { r ->
+            val ovr = if (mins != null && r.mode != "manual") r.ovr + (d to if (mins < 0) -1 else mins * 60) else r.ovr
+            when (d) {
+                "fan" -> r.copy(fan = on, ovr = ovr); "lights" -> r.copy(lights = on, ovr = ovr); "heater" -> r.copy(heater = on, ovr = ovr)
+                "servo" -> r.copy(servo = on, ovr = ovr); "pump" -> r.copy(pump = on, ovr = ovr); else -> r
+            }
+        }
         return ok
     }
-
-    private fun optimistic(device: String, v: Boolean) {
-        val r = latest.value ?: return
-        latest.value = when (device) {
-            "fan" -> r.copy(fan = v, auto = false)
-            "pump" -> r.copy(pump = v, auto = false)
-            "lights" -> r.copy(lights = v, auto = false)
-            "heater" -> r.copy(heater = v, auto = false)
-            "servo" -> r.copy(servo = v, auto = false)
-            "auto" -> r.copy(auto = v)
-            else -> r
-        }
-    }
-
-    fun waterNow(seconds: Int): Boolean =
-        send(JSONObject().put("device", "water").put("value", seconds).toString())
-
-    fun allOff(): Boolean = send(JSONObject().put("device", "alloff").toString())
-
+    fun setMode(m: String): Boolean = send(cmd("mode", m)).also { if (it) optimistic { r -> r.copy(mode = m, ovr = if (m == "manual") emptyMap() else r.ovr) } }
+    fun clearOverride(d: String): Boolean = send(cmd("ovr_clear", d)).also { if (it) optimistic { r -> r.copy(ovr = if (d == "all") emptyMap() else r.ovr - d) } }
+    fun waterNow(seconds: Int): Boolean = send(cmd("water", seconds)).also { if (it) optimistic { r -> r.copy(pump = true, watering = seconds) } }
+    fun stopWater(): Boolean = send(cmd("stopwater")).also { if (it) optimistic { r -> r.copy(pump = false, watering = 0) } }
+    fun allOff(): Boolean = send(cmd("alloff")).also { if (it) optimistic { r -> r.copy(fan = false, pump = false, lights = false, heater = false, servo = false, mode = "manual", ovr = emptyMap(), watering = 0) } }
+    fun config(j: JSONObject): Boolean = send(j.put("device", "config"))
+    fun calibrate(what: String): Boolean = send(cmd("cal", what))
+    fun viewLink(on: Boolean): Boolean = send(cmd("view", on))
+    fun telegramTest(): Boolean = send(cmd("tgtest"))
+    fun updateFirmware(): Boolean = send(cmd("ota"))
+    fun reboot(): Boolean = send(cmd("reboot"))
     /** New private cloud key on the board: old share links stop working. Wi-Fi only. */
-    fun newCloudKey(): Boolean = via.value == Via.WIFI && send(JSONObject().put("device", "rekey").toString())
+    fun newCloudKey(): Boolean = via.value == Via.WIFI && send(cmd("rekey"))
+    fun setWifi(ssid: String, pass: String): Boolean = via.value == Via.WIFI && send(cmd("wifi").put("ssid", ssid).put("pass", pass))
 
     fun rename(name: String): Boolean {
-        val ok = send(JSONObject().put("device", "name").put("value", name).toString())
+        val ok = send(cmd("name", name))
         if (ok) Prefs.saveGreenhouse(SavedGh(name, address, latest.value?.id ?: "", cloud?.code() ?: ""))
         return ok
     }
 
+    private fun optimistic(f: (Reading) -> Reading) {
+        val r = latest.value ?: return
+        latest.value = f(r)
+    }
+
+    /** Sends a .bin file to the board over Wi-Fi (http://<ip>/update). [progress] gets 0..1. */
+    suspend fun uploadFirmware(c: Context, uri: Uri, progress: (Float) -> Unit): Boolean = withContext(Dispatchers.IO) {
+        val host = localHost() ?: return@withContext false
+        val key = latest.value?.key ?: ""
+        val size = c.contentResolver.openFileDescriptor(uri, "r")?.use { it.statSize } ?: -1L
+        val body = object : RequestBody() {
+            override fun contentType(): MediaType = "application/octet-stream".toMediaType()
+            override fun contentLength() = size
+            override fun writeTo(sink: BufferedSink) {
+                c.contentResolver.openInputStream(uri)?.use { inp ->
+                    val buf = ByteArray(8192)
+                    var sent = 0L
+                    while (true) {
+                        val n = inp.read(buf)
+                        if (n < 0) break
+                        sink.write(buf, 0, n)
+                        sent += n
+                        if (size > 0) progress(sent.toFloat() / size)
+                    }
+                }
+            }
+        }
+        val multipart = MultipartBody.Builder().setType(MultipartBody.FORM).addFormDataPart("update", "firmware.bin", body).build()
+        val req = Request.Builder().url("http://$host/update").header("X-Key", key).post(multipart).build()
+        try {
+            httpFor(host).newBuilder().pingInterval(0, TimeUnit.SECONDS).writeTimeout(120, TimeUnit.SECONDS).readTimeout(60, TimeUnit.SECONDS).build()
+                .newCall(req).execute().use { it.isSuccessful }
+        } catch (e: Exception) { false }
+    }
+
     /* ---------------- incoming readings ---------------- */
 
-    private fun handle(text: String, producedAt: Long) {
-        val r = Reading.parse(text)?.copy(ts = producedAt) ?: return
-        lastMsgAt = producedAt
+    private fun handle(r: Reading) {
+        lastMsgAt = r.ts
         val first = latest.value == null
         latest.value = r
         remember(r, first)
         live.value = (live.value + r).takeLast(90)
 
         val now = r.ts
-        if (now - lastLogged >= Prefs.logEverySec * 1000L) {
-            lastLogged = now
-            History.add(r.toSample())
-        }
-        if (now - lastPrune > 3_600_000L) {
-            lastPrune = now
-            History.prune(now - 180L * 86_400_000L) // keep 6 months
-        }
+        if (now - lastLogged >= Prefs.logEverySec * 1000L) { lastLogged = now; History.add(r.toSample()) }
+        if (now - lastPrune > 3_600_000L) { lastPrune = now; History.prune(now - 180L * 86_400_000L) }
 
-        val cur = r.alerts()
+        val cur = r.alerts(cfg.value)
         val prev = activeAlerts.value
-        cur.forEach { (key, msg) ->
-            if (key !in prev) {
+        cur.forEach { key ->
+            if (key !in prev && !first) {
+                val msg = Notifier.alertText(app, key, r, wx.value)
                 History.logAlert(msg)
-                Notifier.alert(app, msg)
+                Notifier.alert(app, r.name, msg)
             }
         }
         activeAlerts.value = cur
+        if (System.currentTimeMillis() - lastWidget > 60_000) { lastWidget = System.currentTimeMillis(); Widget.update(app, r) }
     }
 
-    /**
-     * Pairing: the board puts its cloud key in every packet, so the first Wi-Fi connection saves it
-     * and from then on the greenhouse works from anywhere. Also follows the board to a new IP.
-     */
+    /** Pairing: the board puts its cloud key in every packet; the first Wi-Fi connection saves it. */
     private fun remember(r: Reading, first: Boolean) {
         val ref = if (r.key.length >= 16 && r.db.isNotEmpty()) CloudRef(r.key, r.db) else null
-        val keyChanged = ref != null && ref != cloud
-        if (keyChanged && via.value == Via.WIFI) cloud = ref
+        val keyChanged = ref != null && ref != cloud && via.value == Via.WIFI
+        if (keyChanged) cloud = ref
         val curHost = try { URI(url).host ?: "" } catch (e: Exception) { "" }
         val ipChanged = via.value == Via.CLOUD && r.ip.isNotEmpty() && r.ip != "0.0.0.0" &&
             Regex("^\\d+\\.\\d+\\.\\d+\\.\\d+$").matches(curHost) && curHost != r.ip
-        if (ipChanged) {                                   // DHCP gave the board a new address
-            Prefs.greenhouses.firstOrNull { it.id == r.id && it.id.isNotEmpty() }?.let { Prefs.removeGreenhouse(it.addr) }
+        if (ipChanged) {
+            Prefs.greenhouses.firstOrNull { it.id == r.id && it.id.isNotEmpty() && !it.viewOnly }?.let { Prefs.removeGreenhouse(it.addr) }
             url = buildUrl(r.ip); address = r.ip; Prefs.lastAddress = address
         }
         if (first || r.name != namedAs || keyChanged || ipChanged) {
             namedAs = r.name
             Prefs.saveGreenhouse(SavedGh(r.name, address, r.id, cloud?.code() ?: ""))
         }
+    }
+
+    /* ---------------- journal (stored in the cloud so the whole team sees it) ---------------- */
+
+    data class Entry(val id: String, val t: Long, val k: String, val x: String, val g: Float, val thumb: String)
+
+    suspend fun journal(): List<Entry>? = withContext(Dispatchers.IO) {
+        val ref = cloud ?: return@withContext null
+        try {
+            val u = "${ref.base}/journal.json?orderBy=%22%24key%22&limitToLast=60"
+            val text = cloudHttp.newCall(Request.Builder().url(u).build()).execute().use { if (it.isSuccessful) it.body?.string() else null } ?: return@withContext null
+            if (text == "null") return@withContext emptyList()
+            val j = JSONObject(text)
+            j.keys().asSequence().mapNotNull { id ->
+                j.optJSONObject(id)?.let { o -> Entry(id, o.optLong("t"), o.optString("k", "note"), o.optString("x"), o.optDouble("g", 0.0).toFloat(), o.optString("th")) }
+            }.sortedByDescending { it.t }.toList()
+        } catch (e: Exception) { null }
+    }
+
+    suspend fun addEntry(kind: String, text: String, grams: Float, thumb: String?, full: String?): Boolean = withContext(Dispatchers.IO) {
+        val ref = cloud ?: return@withContext false
+        if (ref.ro) return@withContext false
+        val e = JSONObject().put("t", JSONObject().put(".sv", "timestamp")).put("k", kind).put("x", text)
+        if (kind == "harvest") e.put("g", grams)
+        if (thumb != null) e.put("th", thumb)
+        try {
+            val name = cloudHttp.newCall(Request.Builder().url("${ref.base}/journal.json").post(e.toString().toRequestBody(JSON_TYPE)).build())
+                .execute().use { if (it.isSuccessful) JSONObject(it.body!!.string()).optString("name") else null } ?: return@withContext false
+            if (full != null) put("${ref.base}/photos/$name.json", JSONObject.quote(full))
+            latest.value?.view?.takeIf { it.isNotBlank() }?.let { vk ->
+                val vb = "https://${ref.db}/hbrt/$vk"
+                put("$vb/journal/$name.json", e.toString())
+                if (full != null) put("$vb/photos/$name.json", JSONObject.quote(full))
+            }
+            true
+        } catch (x: Exception) { false }
+    }
+
+    suspend fun deleteEntry(id: String) = withContext(Dispatchers.IO) {
+        val ref = cloud ?: return@withContext
+        val bases = listOf(ref.base) + (latest.value?.view?.takeIf { it.isNotBlank() }?.let { listOf("https://${ref.db}/hbrt/$it") } ?: emptyList())
+        for (b in bases) for (p in listOf("journal", "photos")) try {
+            cloudHttp.newCall(Request.Builder().url("$b/$p/$id.json").delete().build()).execute().close()
+        } catch (e: Exception) { }
+    }
+
+    suspend fun photo(id: String): String? = withContext(Dispatchers.IO) {
+        val ref = cloud ?: return@withContext null
+        try {
+            cloudHttp.newCall(Request.Builder().url("${ref.base}/photos/$id.json").build()).execute().use { r ->
+                if (!r.isSuccessful) null else r.body?.string()?.let { if (it == "null") null else JSONArray("[$it]").getString(0) }
+            }
+        } catch (e: Exception) { null }
+    }
+
+    private fun put(url: String, body: String) {
+        cloudHttp.newCall(Request.Builder().url(url).put(body.toRequestBody(JSON_TYPE)).build()).execute().close()
     }
 }
