@@ -240,6 +240,8 @@
     <string name="plan_skip">%1$s: باران وړاندوینه شوی، اوبه نه ورکول کیږي.</string>
     <string name="plan_soil">کله چې خاوره له %1$s٪ ښکته شي هم اوبه ورکوي.</string>
     <string name="view_only_note">دا لینک یوازې د کتلو لپاره دی. د بدلون لپاره له خاوند څخه د کنټرول لینک وغواړئ.</string>
+    <string name="rst_brown">بورډ همدا اوس بیا چالان شو ځکه برېښنا یې کمه شوه. ریلو او پمپ ته جلا ۵ ولټه سرچینه ورکړئ (GND دې ESP32 ته وصل وي).</string>
+    <string name="rst_crash">بورډ همدا اوس ناڅاپه بیا چالان شو. که بیا پېښ شو، Serial Monitor وګورئ.</string>
     <string name="h_title">تاریخچه</string>
     <string name="h_temp">تودوخه</string>
     <string name="h_hum">لندبل</string>

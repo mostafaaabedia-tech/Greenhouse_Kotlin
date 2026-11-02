@@ -276,6 +276,13 @@ S = [
 ("plan_soil", "Also waters when the soil drops below {0}%.", "وقتی خاک زیر {0}٪ برود هم آبیاری می‌کند.", "کله چې خاوره له {0}٪ ښکته شي هم اوبه ورکوي."),
 ("view_only_note", "This is a view-only link. Ask the owner for the control link to change things.", "این لینک فقط برای دیدن است. برای تغییر، لینک کنترول را از صاحبش بگیرید.", "دا لینک یوازې د کتلو لپاره دی. د بدلون لپاره له خاوند څخه د کنټرول لینک وغواړئ."),
 
+("rst_brown", "The board just restarted because its power dropped. Give the relays and the pump their own 5 V supply (GND connected to the ESP32).",
+ "بورد همین حالا دوباره روشن شد چون برقش کم شد. برای ریله‌ها و پمپ یک منبع ۵ ولت جدا بگذارید (GND به ESP32 وصل باشد).",
+ "بورډ همدا اوس بیا چالان شو ځکه برېښنا یې کمه شوه. ریلو او پمپ ته جلا ۵ ولټه سرچینه ورکړئ (GND دې ESP32 ته وصل وي)."),
+("rst_crash", "The board just restarted unexpectedly. If it keeps happening, check the Serial Monitor.",
+ "بورد همین حالا ناگهان دوباره روشن شد. اگر تکرار شد، Serial Monitor را ببینید.",
+ "بورډ همدا اوس ناڅاپه بیا چالان شو. که بیا پېښ شو، Serial Monitor وګورئ."),
+
 # ---------- history ----------
 ("h_title", "History", "تاریخچه", "تاریخچه"),
 ("h_temp", "Temperature", "حرارت", "تودوخه"),

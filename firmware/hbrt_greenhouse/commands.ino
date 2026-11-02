@@ -16,7 +16,8 @@ void setMode(uint8_t m, uint8_t by) {
   if (m > M_AWAY || m == mode) return;
   uint8_t old = mode;
   mode = m;
-  if (old == M_MANUAL) for (int d = 0; d < D_COUNT; d++) ovrUntil[d] = 0;   // fresh start in automatic
+  for (int d = 0; d < D_COUNT; d++) ovrUntil[d] = 0;    // timed overrides belong to one mode: start fresh
+  if (m == M_MANUAL && waterUntil) { stopWatering(); setDev(D_PUMP, false, by, RS_NONE, 0); }
   prefs.begin("hbrt", false); prefs.putUChar("mode", mode); prefs.end();
   logEvent(E_MODE, 255, by, RS_NONE, m, 0);
 }
@@ -135,22 +136,21 @@ void applyCommand(JsonDocument& doc, int wsNum, uint8_t by) {
     bool v = doc["value"] | false;
     bool hasMins = !doc["mins"].isNull();
     int mins = doc["mins"] | 0;
-    if (d == D_PUMP && mode == M_MANUAL && hasMins) {
-      // manual mode: the pump is a plain switch, even with an empty tank (you are in charge)
-      stopWatering(); pumpLockUntil = 0;
-      setDev(D_PUMP, v, by, RS_MANUAL, 0);
+    if (mode == M_MANUAL && hasMins) {
+      // manual mode: every device is a plain switch. The pump works even with an empty tank (you are in charge).
+      if (d == D_PUMP) { stopWatering(); pumpLockUntil = 0; }
+      ovrUntil[d] = 0;
+      setDev(d, v, by, RS_MANUAL, 0);
     } else if (d == D_PUMP) {
       if (v) { ovrUntil[D_PUMP] = 0; startWatering(doc["sec"] | cfg.pumpMaxSec, by); }
       else {
         stopWatering();
         if (!hasMins) setMode(M_MANUAL, by);
-        else if (mode != M_MANUAL) setOverride(D_PUMP, false, mins, by);
+        else setOverride(D_PUMP, false, mins, by);
         setDev(D_PUMP, false, by, RS_NONE, 0);
       }
     } else if (!hasMins) {                    // old apps: switching a device means manual mode
       setMode(M_MANUAL, by);
-      setDev(d, v, by, RS_NONE, 0);
-    } else if (mode == M_MANUAL) {
       setDev(d, v, by, RS_NONE, 0);
     } else {
       setOverride(d, v, mins, by);
@@ -222,6 +222,7 @@ void drainCommands() {
   while (xQueueReceive(cmdQueue, &m, 0) == pdTRUE) {
     JsonDocument doc;
     if (!deserializeJson(doc, m.json)) applyCommand(doc, -1, m.by);
+    cmdDone++;
   }
 }
 

@@ -496,6 +496,7 @@ object GreenhouseClient {
         val j = cmd(d, on)
         if (mins != null) j.put("mins", mins)
         val ok = send(j)
+        if (ok) expect(if (d == "vent") "servo" else d, on)
         if (ok) optimistic { r ->
             val ovr = if (mins != null && r.mode != "manual") r.ovr + (d to if (mins < 0) -1 else mins * 60) else r.ovr
             when (d) {
@@ -505,11 +506,11 @@ object GreenhouseClient {
         }
         return ok
     }
-    fun setMode(m: String): Boolean = send(cmd("mode", m)).also { if (it) optimistic { r -> r.copy(mode = m, ovr = if (m == "manual") emptyMap() else r.ovr) } }
+    fun setMode(m: String): Boolean = send(cmd("mode", m)).also { if (it) expect("mode", m); if (it) optimistic { r -> r.copy(mode = m, ovr = if (m == "manual") emptyMap() else r.ovr) } }
     fun clearOverride(d: String): Boolean = send(cmd("ovr_clear", d)).also { if (it) optimistic { r -> r.copy(ovr = if (d == "all") emptyMap() else r.ovr - d) } }
     fun waterNow(seconds: Int): Boolean = send(cmd("water", seconds)).also { if (it) optimistic { r -> r.copy(pump = true, watering = seconds) } }
-    fun stopWater(): Boolean = send(cmd("stopwater")).also { if (it) optimistic { r -> r.copy(pump = false, watering = 0) } }
-    fun allOff(): Boolean = send(cmd("alloff")).also { if (it) optimistic { r -> r.copy(fan = false, pump = false, lights = false, heater = false, servo = false, mode = "manual", ovr = emptyMap(), watering = 0) } }
+    fun stopWater(): Boolean = send(cmd("stopwater")).also { if (it) expect("pump", false); if (it) optimistic { r -> r.copy(pump = false, watering = 0) } }
+    fun allOff(): Boolean = send(cmd("alloff")).also { if (it) { DEVICES.forEach { d -> expect(d, false) }; expect("mode", "manual") }; if (it) optimistic { r -> r.copy(fan = false, pump = false, lights = false, heater = false, servo = false, mode = "manual", ovr = emptyMap(), watering = 0) } }
     fun config(j: JSONObject): Boolean = send(j.put("device", "config"))
     fun calibrate(what: String): Boolean = send(cmd("cal", what))
     fun viewLink(on: Boolean): Boolean = send(cmd("view", on))
@@ -529,6 +530,27 @@ object GreenhouseClient {
     private fun optimistic(f: (Reading) -> Reading) {
         val r = latest.value ?: return
         latest.value = f(r)
+    }
+
+    /* What you just tapped wins over older packets that were already on their way, until the board
+       confirms it (or 8 s pass). Without this a switch can flick back for a moment. */
+    private val expected = java.util.concurrent.ConcurrentHashMap<String, Pair<Any, Long>>()
+    private fun expect(key: String, v: Any) { expected[key] = v to System.currentTimeMillis() + 8_000 }
+    private fun settle(r: Reading): Reading {
+        if (expected.isEmpty()) return r
+        var x = r
+        val now = System.currentTimeMillis()
+        for ((k, p) in expected.entries.toList()) {
+            val (v, until) = p
+            val cur: Any = if (k == "mode") x.mode else x.on(k)
+            if (cur == v || now > until) { expected.remove(k); continue }
+            x = when (k) {
+                "mode" -> x.copy(mode = v as String)
+                "fan" -> x.copy(fan = v as Boolean); "pump" -> x.copy(pump = v as Boolean); "lights" -> x.copy(lights = v as Boolean)
+                "heater" -> x.copy(heater = v as Boolean); else -> x.copy(servo = v as Boolean)
+            }
+        }
+        return x
     }
 
     /** Sends a .bin file to the board over Wi-Fi (http://<ip>/update). [progress] gets 0..1. */
@@ -563,7 +585,8 @@ object GreenhouseClient {
 
     /* ---------------- incoming readings ---------------- */
 
-    private fun handle(r: Reading) {
+    private fun handle(packet: Reading) {
+        val r = settle(packet)
         lastMsgAt = r.ts
         val first = latest.value == null
         latest.value = r

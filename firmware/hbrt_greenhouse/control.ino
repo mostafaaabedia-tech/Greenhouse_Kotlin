@@ -22,8 +22,9 @@ void setDev(int d, bool v, uint8_t by, uint8_t why, float x) {
 
 void startWatering(int sec, uint8_t by) {
   sec = constrain(sec, 1, cfg.pumpMaxSec);
-  if (water <= cfg.waterMin) { logEvent(E_SKIP, D_PUMP, by, RS_TANK, 0, water); return; }
-  if (pumpLocked())          { logEvent(E_SKIP, D_PUMP, by, RS_LOCK, 0, 0); return; }
+  bool manual = mode == M_MANUAL;              // in manual mode you are in charge, even with an empty tank
+  if (!manual && water <= cfg.waterMin) { logEvent(E_SKIP, D_PUMP, by, RS_TANK, 0, water); return; }
+  if (!manual && pumpLocked())          { logEvent(E_SKIP, D_PUMP, by, RS_LOCK, 0, 0); return; }
   waterUntil = millis() + (unsigned long)sec * 1000UL;
   if (waterUntil == 0) waterUntil = 1;
   waterBy = by;
@@ -132,8 +133,9 @@ void control() {
       setDev(d, false, waterBy, RS_DONE, 0);
       continue;
     }
+    if (mode == M_MANUAL) continue;                       // manual: only you switch things
     if (ovrActive(d)) { setDev(d, ovrVal[d], BY_USER, RS_MANUAL, 0); continue; }
-    if (mode == M_MANUAL || !has[d]) continue;
+    if (!has[d]) continue;
     uint8_t by = ruled[d] ? BY_RULE : (mode == M_AWAY ? BY_AWAY : BY_AUTO);
     setDev(d, want[d], by, why[d], wx_[d]);
   }
@@ -141,7 +143,7 @@ void control() {
 
 void safety() {
   // manual mode: no automatic pump stop (empty tank / max run). Watering sessions still end on time.
-  if (mode == M_MANUAL && !waterUntil) { pumpOnSince = 0; return; }
+  if (mode == M_MANUAL) { pumpOnSince = 0; return; }
   if (dev[D_PUMP]) {
     if (!pumpOnSince) pumpOnSince = millis();
     if (water <= cfg.waterMin) {

@@ -240,6 +240,8 @@
     <string name="plan_skip">%1$s: skipped, rain is forecast.</string>
     <string name="plan_soil">Also waters when the soil drops below %1$s%%.</string>
     <string name="view_only_note">This is a view-only link. Ask the owner for the control link to change things.</string>
+    <string name="rst_brown">The board just restarted because its power dropped. Give the relays and the pump their own 5 V supply (GND connected to the ESP32).</string>
+    <string name="rst_crash">The board just restarted unexpectedly. If it keeps happening, check the Serial Monitor.</string>
     <string name="h_title">History</string>
     <string name="h_temp">Temperature</string>
     <string name="h_hum">Humidity</string>

@@ -1,4 +1,4 @@
-/* HBRT AGRO Smart Greenhouse - firmware 6.0
+/* HBRT AGRO Smart Greenhouse - firmware 6.1
    Developed by Mostafa Mesbah Aabedi & Milad Ahmadi
    HBRT - Herat Boys Robotic Team
 
@@ -39,7 +39,7 @@
 #include <time.h>
 #include <esp_system.h>
 
-#define FW_VERSION "6.0.2"
+#define FW_VERSION "6.1"
 
 /* Wi-Fi the board tries first. Pick another one any time on the setup page
    (hold the BOOT button 3 s, or wait 1 minute without Wi-Fi, then join "HBRT-Setup-xxxx"). */
@@ -206,6 +206,7 @@ String otaUrl = OTA_URL;
 volatile int cloudCode = 0;
 volatile uint8_t tgState = 0;                      // 0 off, 1 ok, 2 error
 QueueHandle_t cmdQueue;
+volatile uint32_t cmdDone = 0;                     // commands applied so far (the cloud task waits on it)
 struct CmdMsg { char json[300]; uint8_t by; };
 QueueHandle_t tgQueue;
 struct TgMsg { char text[400]; };

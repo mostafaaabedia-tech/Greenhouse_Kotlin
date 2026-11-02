@@ -97,6 +97,11 @@ fun ControlScreen(r: Reading?, online: Boolean) {
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(16.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         PageTitle(stringResource(R.string.ctl_title))
         if (ro) Notice(stringResource(R.string.view_only_note), Muted)
+        // the board restarted a moment ago: low voltage (brownout) or a crash
+        if (r != null && r.v6 && r.uptime in 1..180) when (r.resetReason) {
+            9 -> Notice(stringResource(R.string.rst_brown), Danger)
+            4, 5, 6, 7 -> Notice(stringResource(R.string.rst_crash), Orange)
+        }
 
         // modes
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {

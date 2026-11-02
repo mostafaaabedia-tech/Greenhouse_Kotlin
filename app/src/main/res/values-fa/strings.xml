@@ -240,6 +240,8 @@
     <string name="plan_skip">%1$s: باران پیش‌بینی شده، آبیاری نمی‌شود.</string>
     <string name="plan_soil">وقتی خاک زیر %1$s٪ برود هم آبیاری می‌کند.</string>
     <string name="view_only_note">این لینک فقط برای دیدن است. برای تغییر، لینک کنترول را از صاحبش بگیرید.</string>
+    <string name="rst_brown">بورد همین حالا دوباره روشن شد چون برقش کم شد. برای ریله‌ها و پمپ یک منبع ۵ ولت جدا بگذارید (GND به ESP32 وصل باشد).</string>
+    <string name="rst_crash">بورد همین حالا ناگهان دوباره روشن شد. اگر تکرار شد، Serial Monitor را ببینید.</string>
     <string name="h_title">تاریخچه</string>
     <string name="h_temp">حرارت</string>
     <string name="h_hum">رطوبت</string>
