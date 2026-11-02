@@ -39,7 +39,7 @@
 #include <time.h>
 #include <esp_system.h>
 
-#define FW_VERSION "6.0"
+#define FW_VERSION "6.0.1"
 
 /* Wi-Fi the board tries first. Pick another one any time on the setup page
    (hold the BOOT button 3 s, or wait 1 minute without Wi-Fi, then join "HBRT-Setup-xxxx"). */
@@ -64,6 +64,12 @@
 #define HEATER_RELAY 26
 #define SERVO_PIN 13
 #define SETUP_PIN 0          // the BOOT button on the board
+
+/* Relay module type. Most relay boards switch ON when the pin is LOW (active LOW).
+   If your relays are ON when they should be OFF (and the app shows the opposite),
+   change this to HIGH. */
+#define RELAY_ON LOW
+#define RELAY_OFF (RELAY_ON == LOW ? HIGH : LOW)
 
 /* ================= TYPES ================= */
 enum Dev  { D_FAN, D_PUMP, D_LIGHTS, D_HEATER, D_VENT, D_COUNT };
@@ -318,14 +324,22 @@ void applyOutputs() {
     if (dev[d] == applied[d]) continue;
     applied[d] = dev[d];
     if (d == D_VENT) { ventServo.write(dev[d] ? 180 : 0); delay(50); }
-    else digitalWrite(DEV_PIN[d], dev[d] ? LOW : HIGH);   // relays are active LOW
+    else digitalWrite(DEV_PIN[d], dev[d] ? RELAY_ON : RELAY_OFF);
   }
 }
 
 /* ================= SETUP ================= */
 void setup() {
   Serial.begin(115200);
+  delay(200);
   bootMs = millis();
+  {
+    esp_reset_reason_t rr = esp_reset_reason();
+    Serial.printf("\n\n=== HBRT AGRO %s starting. Last restart: %s ===\n", FW_VERSION,
+      rr == ESP_RST_POWERON ? "power on" : rr == ESP_RST_SW ? "software" : rr == ESP_RST_PANIC ? "CRASH" :
+      rr == ESP_RST_BROWNOUT ? "LOW VOLTAGE (brownout): power the relays from a separate 5V supply" :
+      rr == ESP_RST_INT_WDT || rr == ESP_RST_TASK_WDT || rr == ESP_RST_WDT ? "watchdog" : "other");
+  }
   char id[7];
   snprintf(id, sizeof(id), "%06X", (uint32_t)(ESP.getEfuseMac() & 0xFFFFFF));
   chipId = id;
@@ -334,7 +348,8 @@ void setup() {
   tgQueue = xQueueCreate(6, sizeof(TgMsg));
   loadConfig();
 
-  for (int d = 0; d < D_COUNT; d++) if (DEV_PIN[d] >= 0) { pinMode(DEV_PIN[d], OUTPUT); digitalWrite(DEV_PIN[d], HIGH); }
+  // set the "off" level first, then make the pin an output, so relays don't click at power-up
+  for (int d = 0; d < D_COUNT; d++) if (DEV_PIN[d] >= 0) { digitalWrite(DEV_PIN[d], RELAY_OFF); pinMode(DEV_PIN[d], OUTPUT); digitalWrite(DEV_PIN[d], RELAY_OFF); }
   pinMode(SETUP_PIN, INPUT_PULLUP);
 
   dht.begin();
@@ -353,8 +368,8 @@ void setup() {
 
   startWiFi();
   for (int i = 0; i < 20 && WiFi.status() != WL_CONNECTED; i++) delay(500);
-  if (WiFi.status() == WL_CONNECTED) Serial.println("IP: " + WiFi.localIP().toString());
-  else Serial.println("No Wi-Fi yet. Retrying, setup page opens after 1 minute.");
+  if (WiFi.status() == WL_CONNECTED) Serial.println("Wi-Fi OK: " + wifiSsid + "  IP: " + WiFi.localIP().toString());
+  else Serial.println("Can't join Wi-Fi \"" + wifiSsid + "\". Retrying. After 1 minute the board opens the hotspot HBRT-Setup-" + chipId + ".");
 
   configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
   setupHttp();
@@ -392,5 +407,14 @@ void loop() {
     checkAlerts();
     updateOLED();
     publish(false);
+  }
+  static unsigned long lastReport = 0;
+  if (millis() - lastReport >= 10000) {
+    lastReport = millis();
+    Serial.printf("[%lus] mode=%s  air=%s  soil=%d%% (raw %d)  tank=%d%% (raw %d)  wifi=%s  | fan=%d pump=%d lights=%d heater=%d vent=%d\n",
+      (millis() - bootMs) / 1000, MODE_NAME[mode],
+      dhtOk ? (String(temperature, 1) + "C " + String(humidity, 0) + "%").c_str() : "NO SENSOR",
+      soil, rawSoil, water, rawWater, WiFi.status() == WL_CONNECTED ? WiFi.localIP().toString().c_str() : "not connected",
+      dev[0], dev[1], dev[2], dev[3], dev[4]);
   }
 }

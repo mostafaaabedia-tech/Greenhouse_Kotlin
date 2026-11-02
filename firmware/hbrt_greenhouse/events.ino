@@ -11,6 +11,12 @@ void logEvent(uint8_t c, uint8_t d, uint8_t by, uint8_t w, uint8_t v, float x) {
   e.n = evSeq; e.t = utcNow(); e.c = c; e.d = d; e.by = by; e.w = w; e.v = v; e.x = x;
   evSeq++;
   xSemaphoreGive(lock);
+  // the same line on the Serial Monitor, so you can see why something switched
+  if (c == E_DEV && d < D_COUNT)
+    Serial.printf("[%lus] %s %s  (by %s%s%s, %.1f)\n", (millis() - bootMs) / 1000, DEV_NAME[d], v ? "ON" : "OFF",
+                  BY_NAME[by], w ? ": " : "", w < RS_COUNT ? WHY_NAME[w] : "", x);
+  else if (c != E_DEV)
+    Serial.printf("[%lus] event %s%s%s\n", (millis() - bootMs) / 1000, EV_NAME[c], d < D_COUNT ? " " : "", d < D_COUNT ? DEV_NAME[d] : "");
 }
 
 void evToJson(const Event& e, JsonObject o) {
