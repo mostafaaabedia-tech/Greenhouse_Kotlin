@@ -140,6 +140,8 @@ void control() {
 }
 
 void safety() {
+  // manual mode: no automatic pump stop (empty tank / max run). Watering sessions still end on time.
+  if (mode == M_MANUAL && !waterUntil) { pumpOnSince = 0; return; }
   if (dev[D_PUMP]) {
     if (!pumpOnSince) pumpOnSince = millis();
     if (water <= cfg.waterMin) {

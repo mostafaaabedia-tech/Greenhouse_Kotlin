@@ -83,6 +83,8 @@ fun ControlScreen(r: Reading?, online: Boolean) {
 
     fun tap(d: String) {
         val cur = r ?: return
+        // manual mode: the pump is a plain on/off switch, like the other devices (works even with an empty tank)
+        if (d == "pump" && mode == "manual" && cur.v6) { ok(GreenhouseClient.device("pump", !cur.pump, 0)); return }
         if (d == "pump") { if (cur.pump || cur.watering > 0) ok(GreenhouseClient.stopWater()) else waterSheet = true; return }
         val v = !cur.on(d)
         when {
@@ -148,7 +150,7 @@ fun ControlScreen(r: Reading?, online: Boolean) {
                                         if (mode != "manual") " · " + stringResource(if (d == "lights" && l.lightSched) R.string.st_schedule else R.string.st_auto) else ""
                                 }
                                 val c = devColor(d)
-                                Bubble(devName(d), st, c, on = on, enabled = online && !ro && !(d == "pump" && !on && (r?.water ?: 0) <= l.waterMin), onClick = { tap(d) }) {
+                                Bubble(devName(d), st, c, on = on, enabled = online && !ro && !(d == "pump" && !on && mode != "manual" && (r?.water ?: 0) <= l.waterMin), onClick = { tap(d) }) {
                                     DevIcon(d, on, if (on) (if (Pal.dark) Color(0xFF081A10) else Color.White) else Muted, Modifier.size(30.dp))
                                 }
                             }

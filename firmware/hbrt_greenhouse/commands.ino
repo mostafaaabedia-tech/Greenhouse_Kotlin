@@ -135,7 +135,11 @@ void applyCommand(JsonDocument& doc, int wsNum, uint8_t by) {
     bool v = doc["value"] | false;
     bool hasMins = !doc["mins"].isNull();
     int mins = doc["mins"] | 0;
-    if (d == D_PUMP) {
+    if (d == D_PUMP && mode == M_MANUAL && hasMins) {
+      // manual mode: the pump is a plain switch, even with an empty tank (you are in charge)
+      stopWatering(); pumpLockUntil = 0;
+      setDev(D_PUMP, v, by, RS_MANUAL, 0);
+    } else if (d == D_PUMP) {
       if (v) { ovrUntil[D_PUMP] = 0; startWatering(doc["sec"] | cfg.pumpMaxSec, by); }
       else {
         stopWatering();
