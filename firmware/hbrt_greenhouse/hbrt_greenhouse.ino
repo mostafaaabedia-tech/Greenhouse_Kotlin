@@ -39,7 +39,7 @@
 #include <time.h>
 #include <esp_system.h>
 
-#define FW_VERSION "6.1.1"
+#define FW_VERSION "6.1.2"
 
 /* Wi-Fi the board tries first. Pick another one any time on the setup page
    (hold the BOOT button 3 s, or wait 1 minute without Wi-Fi, then join "HBRT-Setup-xxxx"). */
@@ -59,7 +59,7 @@
 #define SOIL_PIN 34
 #define WATER_PIN 35
 #define FAN_RELAY 18
-#define PUMP_RELAY 19
+#define PUMP_RELAY 27          // was 19
 #define LIGHTS_RELAY 25
 #define HEATER_RELAY 26
 #define SERVO_PIN 13
