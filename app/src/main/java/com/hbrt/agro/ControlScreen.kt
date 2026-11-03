@@ -155,7 +155,7 @@ fun ControlScreen(r: Reading?, online: Boolean) {
                                         if (mode != "manual") " · " + stringResource(if (d == "lights" && l.lightSched) R.string.st_schedule else R.string.st_auto) else ""
                                 }
                                 val c = devColor(d)
-                                Bubble(devName(d), st, c, on = on, enabled = online && !ro && !(d == "pump" && !on && mode != "manual" && (r?.water ?: 0) <= l.waterMin), onClick = { tap(d) }) {
+                                Bubble(devName(d), st, c, on = on, enabled = online && !ro, onClick = { tap(d) }) {
                                     DevIcon(d, on, if (on) (if (Pal.dark) Color(0xFF081A10) else Color.White) else Muted, Modifier.size(30.dp))
                                 }
                             }
@@ -171,12 +171,13 @@ fun ControlScreen(r: Reading?, online: Boolean) {
                 H2(stringResource(R.string.water_now), Modifier.weight(1f))
                 Text("${stringResource(R.string.m_tank)} ${r.water}%", color = Muted, fontSize = 13.sp)
             }
-            val blocked = when { r.water <= l.waterMin -> stringResource(R.string.tank_block); r.pumpLock -> stringResource(R.string.pump_rest); else -> "" }
-            HoldToWater(r.watering, l.pumpMax, enabled = online && !ro && (blocked.isEmpty() || r.watering > 0))
+            // only a warning: what you start always runs (automatic watering is the one that waits for water)
+            val blocked = if (r.water <= l.waterMin) stringResource(R.string.tank_warn) else ""
+            HoldToWater(r.watering, l.pumpMax, enabled = online && !ro)
             Text(blocked.ifEmpty { stringResource(R.string.hold_hint, l.pumpMax) }, color = if (blocked.isEmpty()) Muted else Danger, fontSize = 13.sp, textAlign = TextAlign.Center)
             Chips {
                 listOf(5, 10, 20, 30, 60).filter { it <= l.pumpMax }.forEach { s ->
-                    Chip(stringResource(R.string.sec_short, s), false, enabled = online && blocked.isEmpty()) {
+                    Chip(stringResource(R.string.sec_short, s), false, enabled = online && !ro) {
                         if (GreenhouseClient.waterNow(s)) toast(ctx, ctx.getString(R.string.watering_for, s)) else toast(ctx, notSent)
                     }
                 }

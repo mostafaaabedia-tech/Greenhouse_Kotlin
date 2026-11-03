@@ -229,6 +229,7 @@
     <string name="watering_left">Watering · %1$s s left</string>
     <string name="stop">Stop</string>
     <string name="tank_block">The tank is empty. Refill it first.</string>
+    <string name="tank_warn">The tank sensor reads empty. Make sure there is water before you start the pump.</string>
     <string name="pump_rest">The pump is resting after a long run. Try again in a few minutes.</string>
     <string name="all_off">All off</string>
     <string name="all_off_sub">Stops everything</string>

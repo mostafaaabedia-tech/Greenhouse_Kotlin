@@ -11,8 +11,8 @@ android {
         applicationId = "com.hbrt.agro"
         minSdk = 24
         targetSdk = 34
-        versionCode = 8
-        versionName = "6.1"
+        versionCode = 9
+        versionName = "6.1.3"
     }
     buildTypes { release { isMinifyEnabled = false } }
     compileOptions {

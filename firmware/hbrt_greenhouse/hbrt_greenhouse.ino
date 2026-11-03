@@ -39,7 +39,7 @@
 #include <time.h>
 #include <esp_system.h>
 
-#define FW_VERSION "6.1.2"
+#define FW_VERSION "6.1.3"
 
 /* Wi-Fi the board tries first. Pick another one any time on the setup page
    (hold the BOOT button 3 s, or wait 1 minute without Wi-Fi, then join "HBRT-Setup-xxxx"). */

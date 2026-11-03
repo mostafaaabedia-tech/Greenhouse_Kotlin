@@ -229,6 +229,7 @@
     <string name="watering_left">اوبه · %1$s ثانیې پاتې</string>
     <string name="stop">ودروه</string>
     <string name="tank_block">ټانکي تشه ده. لومړی یې ډکه کړئ.</string>
+    <string name="tank_warn">د ټانک سنسر خالي ښيي. د پمپ له چالانولو مخکې ډاډ ترلاسه کړئ چې اوبه شته.</string>
     <string name="pump_rest">پمپ له اوږد کار وروسته دمه کوي. څو دقیقې وروسته بیا هڅه وکړئ.</string>
     <string name="all_off">ټول بند</string>
     <string name="all_off_sub">هر څه دروي</string>

@@ -229,6 +229,7 @@
     <string name="watering_left">آبیاری · %1$s ثانیه مانده</string>
     <string name="stop">توقف</string>
     <string name="tank_block">ذخیره خالی است. اول پُرش کنید.</string>
+    <string name="tank_warn">حسگر ذخیره خالی نشان می‌دهد. پیش از روشن کردن پمپ مطمئن شوید آب هست.</string>
     <string name="pump_rest">پمپ بعد از کار طولانی استراحت می‌کند. چند دقیقهٔ بعد امتحان کنید.</string>
     <string name="all_off">خاموشی همه</string>
     <string name="all_off_sub">همه را متوقف می‌کند</string>
