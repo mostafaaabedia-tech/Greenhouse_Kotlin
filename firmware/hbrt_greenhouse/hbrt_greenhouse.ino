@@ -39,7 +39,7 @@
 #include <time.h>
 #include <esp_system.h>
 
-#define FW_VERSION "6.1"
+#define FW_VERSION "6.1.1"
 
 /* Wi-Fi the board tries first. Pick another one any time on the setup page
    (hold the BOOT button 3 s, or wait 1 minute without Wi-Fi, then join "HBRT-Setup-xxxx"). */
@@ -70,6 +70,12 @@
    change this to HIGH. */
 #define RELAY_ON LOW
 #define RELAY_OFF (RELAY_ON == LOW ? HIGH : LOW)
+
+/* At every power-up the board clicks each relay ON for 2 s, one after the other, then opens and
+   closes the vent, so you can see and hear that every channel works. 0 = skip the test.
+   You can run it again any time: type  test  in the Serial Monitor (115200 baud) and press Enter. */
+#define RELAY_TEST_ON_BOOT 1
+#define RELAY_TEST_MS 2000
 
 /* ================= TYPES ================= */
 enum Dev  { D_FAN, D_PUMP, D_LIGHTS, D_HEATER, D_VENT, D_COUNT };
@@ -329,6 +335,51 @@ void applyOutputs() {
   }
 }
 
+/* ================= RELAY TEST =================
+   Each channel ON for RELAY_TEST_MS, then OFF. Watch the relay LED, listen for the click and check
+   that the right device runs. Everything is OFF again afterwards. */
+void relayTest() {
+  const char* label[] = {"Fan", "Pump", "Lights", "Heater"};
+  Serial.println("\n--- Relay test: each channel ON for 2 s ---");
+  for (int d = 0; d < D_COUNT; d++) {
+    char l2[24], l3[24];
+    if (DEV_PIN[d] < 0) {                      // the vent is a servo
+      snprintf(l2, sizeof(l2), "Vent (GPIO %d)", SERVO_PIN);
+      oledMessage("RELAY TEST", l2, "opening...");
+      Serial.printf("Vent servo on GPIO %d: open\n", SERVO_PIN);
+      ventServo.write(180); delay(RELAY_TEST_MS);
+      Serial.println("Vent servo: closed");
+      ventServo.write(0); delay(600);
+      continue;
+    }
+    snprintf(l2, sizeof(l2), "%s (GPIO %d)", label[d], DEV_PIN[d]);
+    snprintf(l3, sizeof(l3), "ON for %d s", RELAY_TEST_MS / 1000);
+    oledMessage("RELAY TEST", l2, l3);
+    Serial.printf("%-7s GPIO %2d -> ON  (pin %s)\n", label[d], DEV_PIN[d], RELAY_ON == LOW ? "LOW" : "HIGH");
+    digitalWrite(DEV_PIN[d], RELAY_ON);
+    delay(RELAY_TEST_MS);
+    digitalWrite(DEV_PIN[d], RELAY_OFF);
+    Serial.printf("%-7s GPIO %2d -> OFF\n", label[d], DEV_PIN[d]);
+    delay(400);
+  }
+  for (int d = 0; d < D_COUNT; d++) applied[d] = !dev[d];   // put every output back to what the board wants
+  applyOutputs();
+  Serial.println("--- Relay test done. If one did not click, check its IN wire and the relay's VCC/GND. ---\n");
+}
+
+void serialCommands() {
+  static String line;
+  while (Serial.available()) {
+    char c = Serial.read();
+    if (c == '\r') continue;
+    if (c != '\n') { if (line.length() < 40) line += c; continue; }
+    line.trim();
+    if (line.equalsIgnoreCase("test")) relayTest();
+    else if (line.length()) Serial.println("Commands: test  (clicks every relay for 2 s)");
+    line = "";
+  }
+}
+
 /* ================= SETUP ================= */
 void setup() {
   Serial.begin(115200);
@@ -365,6 +416,7 @@ void setup() {
   Wire.begin(21, 22);
   u8g2.begin();
   u8g2.setPowerSave(0);
+  if (RELAY_TEST_ON_BOOT) relayTest();
   oledMessage("HBRT AGRO " FW_VERSION, "Connecting to", wifiSsid.c_str());
 
   startWiFi();
@@ -389,6 +441,7 @@ void setup() {
 
 /* ================= LOOP ================= */
 void loop() {
+  serialCommands();
   if (portalOn) dns.processNextRequest();
   server.handleClient();
   webSocket.loop();

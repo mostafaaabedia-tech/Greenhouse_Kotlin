@@ -49,13 +49,18 @@ extern int simPinLevel[40];
 extern int simPinMode[40];
 extern int simAnalog[40];
 inline void pinMode(int p, int m) { if (p >= 0 && p < 40) simPinMode[p] = m; }
-inline void digitalWrite(int p, int v) { if (p >= 0 && p < 40) simPinLevel[p] = v; }
+struct PinEvent { int pin, level; unsigned long at; };
+extern std::vector<PinEvent> simPinLog;
+inline void digitalWrite(int p, int v) { if (p >= 0 && p < 40) { if (simPinLevel[p] != v) simPinLog.push_back({p, v, millis()}); simPinLevel[p] = v; } }
 inline int digitalRead(int p) { return (p >= 0 && p < 40) ? simPinLevel[p] : 1; }
 inline int analogRead(int p) { return (p >= 0 && p < 40) ? simAnalog[p] : 0; }
 
 /* ---------- Serial ---------- */
 struct SerialMock {
   bool quiet = false;
+  std::string input;                         // what the tests "type" into the Serial Monitor
+  int available() { return (int)input.size(); }
+  int read() { if (input.empty()) return -1; char c = input[0]; input.erase(0, 1); return c; }
   void begin(long) {}
   void println(const String& s) { if (!quiet) printf("  [board] %s\n", s.c_str()); }
   void println(const char* s) { if (!quiet) printf("  [board] %s\n", s); }

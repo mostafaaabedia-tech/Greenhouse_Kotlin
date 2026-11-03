@@ -12,6 +12,7 @@ void delay(unsigned long ms) { std::this_thread::sleep_for(std::chrono::millisec
 void vTaskDelay(uint32_t ms) { std::this_thread::sleep_for(std::chrono::milliseconds(ms)); }
 
 int simPinLevel[40], simPinMode[40], simAnalog[40];
+std::vector<PinEvent> simPinLog;
 float simTemp = 24, simHum = 50, simSoilTemp = 20;
 int simServoAngle = -1;
 bool simRunTasks = false;

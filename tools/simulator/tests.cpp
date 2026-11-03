@@ -33,8 +33,31 @@ int main() {
   setSoil(5);      // dry soil
   simAnalog[SETUP_PIN] = 1; simPinLevel[SETUP_PIN] = 1;
 
-  printf("\n== 1. Power-up ==\n");
+  printf("\n== 1. Power-up and relay test ==\n");
+  for (int p : PIN) simPinLevel[p] = RELAY_OFF;
+  simPinLog.clear();
+  unsigned long t0 = millis();
   setup();
+  {
+    // expected: fan, pump, lights, heater each ON once for ~2 s, in that order, then OFF; then the vent
+    std::vector<PinEvent> on;
+    for (auto& e : simPinLog) if (e.level == RELAY_ON) on.push_back(e);
+    bool order = on.size() >= 4 && on[0].pin == FAN_RELAY && on[1].pin == PUMP_RELAY && on[2].pin == LIGHTS_RELAY && on[3].pin == HEATER_RELAY;
+    CHECK(order, "relay test clicks fan, pump, lights, heater in order");
+    bool twoSec = true;
+    for (auto& e : on) {
+      auto off = std::find_if(simPinLog.begin(), simPinLog.end(), [&](const PinEvent& x) { return x.pin == e.pin && x.level == RELAY_OFF && x.at >= e.at; });
+      if (off == simPinLog.end() || off->at - e.at < 1900 || off->at - e.at > 2300) twoSec = false;
+    }
+    CHECK(twoSec, "each relay stays ON for 2 s and then OFF");
+    bool oneAtATime = true;
+    for (size_t i = 1; i < on.size() && i < 4; i++) {
+      auto off = std::find_if(simPinLog.begin(), simPinLog.end(), [&](const PinEvent& x) { return x.pin == on[i - 1].pin && x.level == RELAY_OFF && x.at >= on[i - 1].at; });
+      if (off == simPinLog.end() || off->at > on[i].at) oneAtATime = false;
+    }
+    CHECK(oneAtATime, "only one relay ON at a time");
+    printf("        (test took %.1f s)\n", (millis() - t0) / 1000.0);
+  }
   CHECK(!relay(D_FAN) && !relay(D_PUMP) && !relay(D_LIGHTS) && !relay(D_HEATER), "all relays OFF after power-up");
   CHECK(simPinLevel[PUMP_RELAY] == HIGH, "pump pin is HIGH (= off for an active-LOW relay)");
   run(6000);
@@ -168,6 +191,15 @@ int main() {
   cmd("{\"device\":\"fan\",\"value\":true}");
   CHECK(mode == M_MANUAL && relay(D_FAN), "old app: switching a device = manual + ON");
   cmd("{\"device\":\"fan\",\"value\":false}");
+
+  printf("\n== 13. Relay test from the Serial Monitor ==\n");
+  cmd("{\"device\":\"lights\",\"value\":true,\"mins\":0}");
+  simPinLog.clear();
+  Serial.input = "test\n";
+  loop();
+  int clicks = 0; for (auto& e : simPinLog) if (e.level == RELAY_ON) clicks++;
+  CHECK(clicks >= 3, "typing 'test' clicks every relay again");
+  CHECK(relay(D_LIGHTS) && !relay(D_PUMP) && !relay(D_FAN), "afterwards every relay is back as it was (lights stay ON)");
 
   printf("\n== 13. Saved across a restart ==\n");
   CHECK(simNvs.count("mode") && simNvs["mode"][0] == M_MANUAL, "manual mode is saved");
